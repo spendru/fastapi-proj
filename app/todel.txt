@@ -440,3 +440,89 @@ app.dependency_overrides[S3Service] = lambda: S3Service()
 app.include_router(s3.router)
 
 
+#with _init.py implementation
+# app/__init__.py
+from .config.settings import settings
+
+__version__ = "1.0.0"
+
+# app/config/__init__.py
+from .settings import Settings, settings
+
+__all__ = ["Settings", "settings"]
+
+# app/core/__init__.py
+from .database import get_db, Base, engine
+from .aws_clients import get_cognito_client
+from .security import get_password_hash, verify_password
+
+__all__ = [
+    "get_db",
+    "Base",
+    "engine",
+    "get_cognito_client",
+    "get_password_hash",
+    "verify_password"
+]
+
+# app/api/__init__.py
+from .v1.router import api_router
+
+__all__ = ["api_router"]
+
+# app/api/v1/__init__.py
+from .router import api_router
+
+__all__ = ["api_router"]
+
+# app/api/v1/endpoints/__init__.py
+from .health import router as health_router
+from .users import router as users_router
+
+__all__ = ["health_router", "users_router"]
+
+# app/models/__init__.py
+from .user import User
+
+__all__ = ["User"]
+
+# app/schemas/__init__.py
+from .user import UserCreate, UserResponse
+
+__all__ = ["UserCreate", "UserResponse"]
+
+# app/schemas/user.py
+from pydantic import BaseModel, EmailStr
+from datetime import datetime
+from typing import Optional
+
+class UserBase(BaseModel):
+    email: EmailStr
+
+class UserCreate(UserBase):
+    password: str
+
+class UserResponse(UserBase):
+    id: int
+    cognito_id: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+# app/core/security.py
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+# app/services/__init__.py
+from .cognito import CognitoService
+
+__all__ = ["CognitoService"]
