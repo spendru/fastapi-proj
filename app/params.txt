@@ -1,0 +1,20 @@
+[
+  {
+    "ParameterKey": "VpcId",
+    "ParameterValue": "vpc-xxxxxx"
+  },
+  {
+    "ParameterKey": "DomainName",
+    "ParameterValue": "your-domain.com"
+  },
+  {
+    "ParameterKey": "HostedZoneId",
+    "ParameterValue": "ZXXXXXXXXXXXXXX"
+  },
+  {
+    "ParameterKey": "NotificationEmail",
+    "ParameterValue": "aa@bb.com"
+  }
+]
+
+
