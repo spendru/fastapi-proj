@@ -12,9 +12,11 @@
     "ParameterValue": "ZXXXXXXXXXXXXXX"
   },
   {
+    "ParameterKey": "CertificateArn",
+    "ParameterValue": "arn:aws:acm:region:account:certificate/xxxxxx"
+  },
+  {
     "ParameterKey": "NotificationEmail",
     "ParameterValue": "aa@bb.com"
   }
 ]
-
-
