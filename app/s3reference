@@ -1,0 +1,93 @@
+from pydantic import BaseModel
+
+class PresignedUrlRequest(BaseModel):
+    prefix: str
+    filename: str
+
+@router.post("/s3/generate-presigned-url", tags=["S3"])
+def generate_presigned_url(request: PresignedUrlRequest):
+    """
+    Generate a pre-signed URL for uploading a file to S3.
+    """
+    key = f"{request.prefix}/{request.filename}"
+    url = generate_presigned_url_for_upload(key)
+    return {"upload_url": url, "key": key}
+
+
+-------------------------------------------
+
+url = s3_client.generate_presigned_url(
+    "put_object",
+    Params={
+        "Bucket": S3_BUCKET_NAME,
+        "Key": key,
+        "ContentType": "text/plain",  # Optional
+        "Metadata": {"uploaded-by": "user123"}  # Optional metadata
+    },
+    ExpiresIn=expiration,
+)
+
+--------------------------------------------------
+from fastapi import APIRouter, HTTPException, Form
+from app.s3_service import generate_presigned_url_for_upload
+from app.logger import logger
+
+router = APIRouter()
+
+@router.post("/s3/generate-presigned-url", tags=["S3"])
+def generate_presigned_url(prefix: str = Form(...), filename: str = Form(...)):
+    """
+    Generate a pre-signed URL for uploading a file to S3.
+    """
+    logger.info(f"Request to generate pre-signed URL for prefix: {prefix}, filename: {filename}")
+    try:
+        key = f"{prefix}/{filename}"
+        url = generate_presigned_url_for_upload(key)
+        response = {"message": "Pre-signed URL generated successfully", "upload_url": url, "key": key}
+        logger.info(f"Response: {response}")
+        return response
+    except RuntimeError as e:
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+------------------------------------------------------------------------------
+
+s3.service --
+
+import boto3
+from botocore.exceptions import ClientError
+from typing import Optional
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION,
+)
+
+def generate_presigned_url_for_upload(key: str, expiration: int = 3600) -> str:
+    """
+    Generate a pre-signed URL for uploading a file to S3.
+    :param key: The S3 object key (file path).
+    :param expiration: Time in seconds for the URL to remain valid (default: 3600).
+    :return: A pre-signed URL.
+    """
+    try:
+        url = s3_client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": S3_BUCKET_NAME, "Key": key},
+            ExpiresIn=expiration,
+        )
+        return url
+    except ClientError as e:
+        raise RuntimeError(f"Failed to generate pre-signed URL: {str(e)}")
+------------------------------------------------------------------------------------
