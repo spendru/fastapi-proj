@@ -91,3 +91,32 @@ def generate_presigned_url_for_upload(key: str, expiration: int = 3600) -> str:
     except ClientError as e:
         raise RuntimeError(f"Failed to generate pre-signed URL: {str(e)}")
 ------------------------------------------------------------------------------------
+cors --
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from routers import s3_router
+
+app = FastAPI()
+
+# Example of dynamically fetching origins
+def get_allowed_origins():
+    # Fetch allowed origins dynamically, e.g., from a database or environment variable
+    # Example: os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000,http://example.com").split(",")
+    return [
+        "http://localhost:3000",  # Local frontend
+        "http://example.com",     # Production frontend
+    ]
+
+# Add CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_allowed_origins(),  # Dynamic origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
+
+# Include your routes
+app.include_router(s3_router)
+-----------------------------------------------------------------------
