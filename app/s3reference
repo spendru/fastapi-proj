@@ -120,3 +120,74 @@ app.add_middleware(
 # Include your routes
 app.include_router(s3_router)
 -----------------------------------------------------------------------
+s3 down load
+
+from fastapi import APIRouter, HTTPException, Form
+import boto3
+from botocore.exceptions import ClientError
+import os
+
+router = APIRouter()
+
+# AWS S3 Client Configuration
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "your-bucket-name")
+
+s3_client = boto3.client("s3", region_name=AWS_REGION)
+
+def generate_presigned_url_for_download(key: str, expiration: int = 3600):
+    """
+    Generate a pre-signed URL for downloading a file from S3.
+    :param key: The S3 object key (path).
+    :param expiration: Expiration time in seconds for the pre-signed URL.
+    :return: A pre-signed URL or raises an error.
+    """
+    try:
+        response = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET_NAME, "Key": key},
+            ExpiresIn=expiration,
+        )
+        return response
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"Error generating pre-signed URL: {e}")
+
+@router.post("/s3/generate-download-url", tags=["S3"])
+def generate_download_url(prefix: str = Form(...), filename: str = Form(...)):
+    """
+    Generate a pre-signed URL for downloading a file from S3.
+    """
+    key = f"{prefix}/{filename}"
+    url = generate_presigned_url_for_download(key)
+    return {"download_url": url, "key": key}
+__________________________________________________________________________________
+s3 list---
+
+def list_s3_objects(prefix: str) -> List[str]:
+    """
+    List objects in an S3 bucket under a given prefix.
+    """
+    try:
+        response = s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=prefix)
+        if "Contents" not in response:
+            return []
+        return [obj["Key"] for obj in response["Contents"]]
+    except ClientError as e:
+        raise RuntimeError(f"Failed to list objects in S3: {str(e)}")
+
+
+from fastapi import APIRouter, HTTPException, UploadFile, Form
+from app.s3_service import list_s3_objects, upload_file_to_s3
+
+router = APIRouter()
+
+@router.get("/s3/list", tags=["S3"])
+def list_objects(prefix: str = Form(...)):
+    """
+    List objects in an S3 bucket under a given prefix.
+    """
+    try:
+        objects = list_s3_objects(prefix)
+        return {"prefix": prefix, "objects": objects}
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
