@@ -1,0 +1,60 @@
+import ldap
+
+def search_ad_group(group_dn, search_group_name):
+  """
+  Searches Active Directory for a group within a given DN.
+
+  Args:
+    group_dn: The distinguished name of the group to search within.
+    search_group_name: The name of the group to search for.
+
+  Returns:
+    A list of dictionaries containing the search results (DN and attributes) 
+    or None if no results are found.
+  """
+
+  # LDAP connection parameters
+  ldap_server = "ldap://your_ad_server.com" # Replace with your AD server address
+  ldap_port = 389  # Default LDAP port
+  bind_dn = "cn=your_bind_user,dc=yourdomain,dc=com"  # Replace with your bind user DN
+  bind_password = "your_bind_password"  # Replace with your bind user password
+
+  try:
+    # Initialize LDAP connection
+    ldap_conn = ldap.initialize(f"{ldap_server}:{ldap_port}")
+    ldap_conn.simple_bind_s(bind_dn, bind_password)
+
+    # Construct the search filter
+    search_filter = f"(&(objectClass=group)(cn={search_group_name}))"
+
+    # Perform the search
+    results = ldap_conn.search_s(group_dn, ldap.SCOPE_SUBTREE, search_filter)
+
+    # Unbind from the LDAP server
+    ldap_conn.unbind_s()
+
+    # Process and return results
+    if results:
+      return results
+    else:
+      return None
+
+  except ldap.LDAPError as e:
+    print(f"An LDAP error occurred: {e}")
+    return None
+
+
+# Example usage:
+group_dn = "OU=SampleOU,DC=yourdomain,DC=com"  # Replace with your sample group DN
+search_group_name = "YourGroupName"  # Replace with the group name you're looking for
+
+search_results = search_ad_group(group_dn, search_group_name)
+
+if search_results:
+  for dn, attributes in search_results:
+    print(f"DN: {dn}")
+    print("Attributes:")
+    for attr, value in attributes.items():
+      print(f"  {attr}: {value}")
+else:
+  print(f"Group '{search_group_name}' not found in '{group_dn}'")
