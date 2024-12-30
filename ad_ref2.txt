@@ -1,0 +1,119 @@
+from ldap3 import Server, Connection, SUBTREE, ALL_ATTRIBUTES
+import json
+from typing import Dict, List, Optional
+
+class ADGroupSearch:
+    def __init__(self, server: str, username: str, password: str):
+        """
+        Initialize AD connection parameters
+        
+        Args:
+            server: AD server address (e.g., 'ldap://your.domain.com')
+            username: AD username with appropriate permissions
+            password: AD user password
+        """
+        self.server = Server(server)
+        self.username = username
+        self.password = password
+        
+    def connect(self) -> Optional[Connection]:
+        """Establish connection to AD server"""
+        try:
+            conn = Connection(
+                self.server,
+                user=self.username,
+                password=self.password,
+                auto_bind=True
+            )
+            return conn
+        except Exception as e:
+            print(f"Connection error: {str(e)}")
+            return None
+
+    def search_groups(self, base_dn: str, group_name: str) -> Dict:
+        """
+        Search for groups in AD based on group name
+        
+        Args:
+            base_dn: Base DN to start search from (e.g., 'DC=company,DC=com')
+            group_name: Name of the group to search for
+            
+        Returns:
+            Dictionary containing search results in JSON format
+        """
+        result_data = {
+            "status": "error",
+            "message": "",
+            "groups": []
+        }
+        
+        conn = self.connect()
+        if not conn:
+            result_data["message"] = "Failed to connect to AD server"
+            return result_data
+            
+        try:
+            # Search filter for groups
+            search_filter = f"(&(objectClass=group)(cn=*{group_name}*))"
+            
+            # Perform the search
+            conn.search(
+                search_base=base_dn,
+                search_filter=search_filter,
+                search_scope=SUBTREE,
+                attributes=ALL_ATTRIBUTES
+            )
+            
+            # Process results
+            groups = []
+            for entry in conn.entries:
+                group_info = {
+                    "dn": entry.entry_dn,
+                    "name": entry.cn.value if hasattr(entry, 'cn') else None,
+                    "description": entry.description.value if hasattr(entry, 'description') else None,
+                    "member_count": len(entry.member.values) if hasattr(entry, 'member') else 0,
+                    "when_created": str(entry.whenCreated.value) if hasattr(entry, 'whenCreated') else None,
+                    "when_changed": str(entry.whenChanged.value) if hasattr(entry, 'whenChanged') else None
+                }
+                groups.append(group_info)
+            
+            result_data.update({
+                "status": "success",
+                "message": f"Found {len(groups)} groups",
+                "groups": groups
+            })
+            
+        except Exception as e:
+            result_data["message"] = f"Search error: {str(e)}"
+        
+        finally:
+            conn.unbind()
+            
+        return result_data
+
+def main():
+    # Example usage
+    ad_config = {
+        "server": "ldap://your.domain.com",
+        "username": "your_username@domain.com",
+        "password": "your_password"
+    }
+    
+    # Sample base DN and group name
+    base_dn = "DC=company,DC=com"
+    group_name = "Admin"
+    
+    # Initialize and perform search
+    ad_search = ADGroupSearch(
+        ad_config["server"],
+        ad_config["username"],
+        ad_config["password"]
+    )
+    
+    results = ad_search.search_groups(base_dn, group_name)
+    
+    # Print results as formatted JSON
+    print(json.dumps(results, indent=2))
+
+if __name__ == "__main__":
+    main()
