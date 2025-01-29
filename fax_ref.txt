@@ -1,0 +1,63 @@
+import pandas as pd
+from fpdf import FPDF
+
+# Sample DataFrame
+data = {'Name': ['Alice', 'Bob', 'Alice', 'Bob', 'Emily', 'Alice'],
+        'City': ['New York', 'London', 'New York', 'London', 'New York', 'Alice'],
+        'Age': [25, 30, 28, 35, 22, 29],
+        'Department': ['Sales', 'Marketing', 'Sales', 'Engineering', 'Sales', 'HR']}
+df = pd.DataFrame(data)
+
+# Function to create a PDF for a group with text and inserted values
+def create_group_pdf(group, filename):
+    """
+    Creates a PDF document for a single group with text and inserted values.
+
+    Args:
+        group: The DataFrame representing a single group.
+        filename: The name of the PDF file to create.
+    """
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+
+    # Group information
+    name = group['Name'].iloc[0]
+    city = group['City'].iloc[0]
+    pdf.cell(200, 10, txt=f"Employee Details for {name} in {city}", ln=True, align='C')
+    pdf.ln(10)
+
+    # Text template with placeholders
+    text_template = """
+    This document contains the details of employees named {name} who are based in {city}.
+
+    Employee Details:
+
+    Name: {name}
+    City: {city}
+    Age: {age}
+    Department: {department}
+
+    """
+
+    # Insert values into the text template and add to PDF
+    for row in group.itertuples(index=False):
+        text = text_template.format(
+            name=row.Name,
+            city=row.City,
+            age=row.Age,
+            department=row.Department
+        )
+        pdf.multi_cell(0, 10, txt=text)
+        pdf.ln(5)  # Add extra space between records
+
+    pdf.output(filename)
+
+# Group the DataFrame by 'Name' and 'City'
+grouped = df.groupby(['Name', 'City'])
+
+# Iterate over the groups and create PDFs
+for (name, city), group in grouped:
+    filename = f"group_{name}_{city}.pdf"
+    create_group_pdf(group, filename)
+    print(f"Created PDF for group: {name}, {city} -> {filename}")
