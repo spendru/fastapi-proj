@@ -1,0 +1,77 @@
+from sqlalchemy import create_engine, update, MetaData, Table
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+
+def update_multiple_columns_sqlalchemy(server, database, username, password, table_name, updates, condition_column, condition_value):
+    """
+    Updates multiple columns in a SQL Server table using SQLAlchemy with parameter binding.
+
+    Args:
+        server: The name of the SQL Server instance.
+        database: The name of the database.
+        username: The database username.
+        password: The database password.
+        table_name: The name of the table to update.
+        updates: A dictionary where keys are column names and values are the new values.
+        condition_column: The column to use in the WHERE clause for filtering.
+        condition_value: The value of the condition_column to filter by.
+    """
+    try:
+        # Create a database connection string
+        connection_string = f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver=ODBC+Driver+17+for+SQL+Server"
+
+        # Create a database engine
+        engine = create_engine(connection_string)
+
+        # Create a session factory
+        Session = sessionmaker(bind=engine)
+
+        # Create a session
+        session = Session()
+
+        # Reflect the table metadata
+        metadata = MetaData()
+        metadata.reflect(bind=engine)
+        table = metadata.tables[table_name]
+
+        # Construct the UPDATE statement
+        stmt = (
+            update(table)
+            .where(getattr(table.c, condition_column) == condition_value)
+            .values(updates)  # Pass the updates dictionary directly
+        )
+
+        # Execute the UPDATE statement
+        session.execute(stmt)
+
+        # Commit the changes
+        session.commit()
+
+        print(f"Successfully updated table '{table_name}' using SQLAlchemy.")
+
+    except SQLAlchemyError as e:
+        print(f"An error occurred: {e}")
+        session.rollback()
+
+    finally:
+        if 'session' in locals():
+            session.close()
+
+
+# Example Usage:
+server = 'your_server_name'
+database = 'your_database_name'
+username = 'your_username'
+password = 'your_password'
+table_name = 'Employees'
+
+# Dictionary of columns to update and their new values
+updates = {
+    'Salary': 75000,
+    'Department': 'HR',
+    'Bonus': 5000
+}
+condition_column = 'EmployeeID'
+condition_value = 101
+
+update_multiple_columns_sqlalchemy(server, database, username, password, table_name, updates, condition_column, condition_value)
