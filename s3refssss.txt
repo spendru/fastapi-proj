@@ -1,0 +1,99 @@
+import boto3
+import os
+from botocore.exceptions import NoCredentialsError, ClientError
+
+def download_s3_folder_to_tmp(bucket_name, s3_folder):
+    """
+    Downloads all objects from an S3 folder directly to the /tmp/ directory in AWS Lambda.
+
+    Args:
+        bucket_name: Name of the source S3 bucket.
+        s3_folder: The folder path in the source S3 bucket.
+    """
+
+    s3_resource = boto3.resource('s3')
+    local_dir = '/tmp/'
+
+    try:
+        bucket = s3_resource.Bucket(bucket_name)
+
+        for obj in bucket.objects.filter(Prefix=s3_folder):
+            if not obj.key.endswith('/'):
+                file_name = os.path.basename(obj.key)
+                local_file_path = os.path.join(local_dir, file_name)
+                bucket.download_file(obj.key, local_file_path)
+                print(f"Downloaded: {obj.key} to {local_file_path}")
+
+    except NoCredentialsError:
+        print("Error: AWS credentials not found.")
+        return False
+    except ClientError as e:
+        print(f"An error occurred: {e}")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return False
+    return True
+
+def upload_file_to_s3(file_name, bucket_name, s3_folder, s3_key=None):
+    """
+    Uploads a file from /tmp to an S3 bucket.
+
+    Args:
+        file_name: Name of the file in /tmp/
+        bucket_name: Name of the target S3 bucket.
+        s3_folder: The folder path in the target S3 bucket.
+        s3_key: S3 key for the uploaded file. If None, it defaults to the file name.
+    """
+    s3_client = boto3.client('s3')
+    local_file_path = os.path.join('/tmp/', file_name)
+
+    try:
+        if s3_key is None:
+            s3_key = os.path.join(s3_folder, file_name)
+        else:
+            s3_key = os.path.join(s3_folder, s3_key)
+
+        s3_client.upload_file(local_file_path, bucket_name, s3_key)
+        print(f"Uploaded: {local_file_path} to s3://{bucket_name}/{s3_key}")
+        return True
+    except FileNotFoundError:
+        print(f"Error: File not found: {local_file_path}")
+        return False
+    except NoCredentialsError:
+        print("Error: AWS credentials not found.")
+        return False
+    except ClientError as e:
+        print(f"An error occurred: {e}")
+        return False
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda function handler.
+    """
+
+    source_bucket_name = 'your-source-bucket-name'  # Replace with your source bucket name
+    source_s3_folder = 'your-source-s3-folder/'  # Replace with the source folder to download from
+    destination_bucket_name = 'your-destination-bucket-name'  # Replace with your destination bucket
+    destination_s3_folder = 'your-destination-s3-folder/'  # Replace with the destination folder to upload to
+
+    # Download files from the source bucket
+    if not download_s3_folder_to_tmp(source_bucket_name, source_s3_folder):
+        return {
+            'statusCode': 500,
+            'body': 'Error downloading files from S3'
+        }
+
+    # List files in /tmp and upload them to the destination bucket
+    for file_name in os.listdir('/tmp/'):
+        if os.path.isfile(os.path.join('/tmp/', file_name)):
+            if not upload_file_to_s3(file_name, destination_bucket_name, destination_s3_folder):
+                return {
+                    'statusCode': 500,
+                    'body': f'Error uploading {file_name} to S3'
+                }
+
+    return {
+        'statusCode': 200,
+        'body': 'Files downloaded from S3 and uploaded to another S3 folder!'
+    }
