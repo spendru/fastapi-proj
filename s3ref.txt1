@@ -1,0 +1,61 @@
+import boto3
+import os
+from botocore.exceptions import NoCredentialsError, ClientError
+
+def download_s3_folder(bucket_name, s3_folder, local_dir):
+    """
+    Downloads all objects from an S3 folder to a local directory.
+
+    Args:
+        bucket_name: Name of the S3 bucket.
+        s3_folder: The folder path in the S3 bucket (e.g., 'myfolder/' or '' for the root).
+        local_dir: The local directory to download the files to.
+    """
+
+    s3_resource = boto3.resource('s3')
+
+    try:
+        bucket = s3_resource.Bucket(bucket_name)
+
+        for obj in bucket.objects.filter(Prefix=s3_folder):
+            # Construct local file path
+            local_file_path = os.path.join(
+                local_dir, os.path.relpath(obj.key, s3_folder)
+            )
+
+            # Create necessary directories if they don't exist
+            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+
+            # Download the file
+            if not obj.key.endswith('/'): # Avoid trying to download the folder itself
+                bucket.download_file(obj.key, local_file_path)
+                print(f"Downloaded: {obj.key} to {local_file_path}")
+
+    except NoCredentialsError:
+        print("Error: AWS credentials not found. Ensure you have configured your credentials.")
+        return
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchBucket':
+            print(f"Error: The specified bucket '{bucket_name}' does not exist.")
+        else:
+            print(f"An error occurred: {e}")
+        return
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda function handler.
+    """
+
+    bucket_name = 'your-bucket-name'  # Replace with your bucket name
+    s3_folder = 'your-s3-folder/'  # Replace with the folder you want to download (or '' for root)
+    local_dir = '/tmp/'
+
+    download_s3_folder(bucket_name, s3_folder, local_dir)
+
+    return {
+        'statusCode': 200,
+        'body': 'S3 folder download complete!'
+    }
