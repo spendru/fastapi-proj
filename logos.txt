@@ -1,0 +1,93 @@
+import pandas as pd
+from fpdf import FPDF
+
+# Sample DataFrame
+data = {'Name': ['Alice', 'Bob', 'Alice', 'Bob', 'Emily', 'Alice'],
+        'City': ['New York', 'London', 'New York', 'London', 'New York', 'Alice'],
+        'Age': [25, 30, 28, 35, 22, 29],
+        'Department': ['Sales', 'Marketing', 'Sales', 'Engineering', 'Sales', 'HR']}
+df = pd.DataFrame(data)
+
+# PDF Class with dynamic header image
+class PDF(FPDF):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logo_path = None  # Initialize logo_path
+
+    def header(self):
+        # Logo (check if logo_path is set)
+        if self.logo_path:
+            self.image(self.logo_path, 10, 8, 33)  # Adjust coordinates as needed
+
+        # Font for header
+        self.set_font('Arial', 'B', 15)
+
+        # Title
+        self.cell(0, 10, 'Employee Details Report', 0, 0, 'C')
+
+        # Line break
+        self.ln(20)
+
+    def footer(self):
+        # Position at 1.5 cm from bottom
+        self.set_y(-15)
+        # Arial italic 8
+        self.set_font('Arial', 'I', 8)
+        # Page number
+        self.cell(0, 10, 'Page ' + str(self.page_no()) + '/{nb}', 0, 0, 'C')
+
+# Function to create a PDF for a group
+def create_group_pdf(group, filename, logo_path=None):
+    pdf = PDF()
+    pdf.alias_nb_pages()
+    pdf.logo_path = logo_path  # Set the logo path
+    pdf.add_page()
+
+    # ... (rest of the create_group_pdf function as before)
+    pdf.set_margins(10, 10, 10)  # Example: 10 mm margins
+
+    pdf.set_font("Arial", size=12)
+
+    # Group information
+    name = group['Name'].iloc[0]
+    city = group['City'].iloc[0]
+    pdf.cell(200, 10, txt=f"Group: Name={name}, City={city}", ln=True, align='C')
+    pdf.ln(10)
+
+    # Calculate and print available width
+    available_width = pdf.w - pdf.l_margin - pdf.r_margin
+
+    text_template = """
+    This document contains the details of employees named {name} who are based in {city}.
+
+    Employee Details:
+
+    Name: {name}
+    City: {city}
+    Age: {age}
+    Department: {department}
+
+    """
+
+    for row in group.itertuples(index=False):
+        text = text_template.format(
+            name=row.Name,
+            city=row.City,
+            age=row.Age,
+            department=row.Department
+        )
+
+        pdf.multi_cell(0, 10, txt=text)  # Try with width=0 again
+        pdf.ln(5)
+
+    pdf.output(filename)
+
+# Group the DataFrame by 'Name' and 'City'
+grouped = df.groupby(['Name', 'City'])
+
+# Iterate over the groups and create PDFs
+for (name, city), group in grouped:
+    filename = f"group_{name}_{city}.pdf"
+    logo_path = f"logo_{name}_{city}.png"  # Construct dynamic logo path based on name and city
+    create_group_pdf(group, filename, logo_path)
+    print(f"Created PDF for group: {name}, {city} -> {filename}")
