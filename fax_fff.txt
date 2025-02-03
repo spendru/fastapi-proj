@@ -1,0 +1,22 @@
+from sqlalchemy import create_engine, text
+
+# Replace with your actual connection string
+connection_string = "mssql+pyodbc://username:password@server/database?driver=ODBC+Driver+17+for+SQL+Server" 
+engine = create_engine(connection_string)
+
+with engine.connect() as connection:
+    # 1. Define the UPDATE statement using text()
+    update_statement = text("""
+        UPDATE employees
+        SET salary = :new_salary, department = :new_department
+        WHERE employee_id = :employee_id
+    """)
+
+    # 2. Execute the statement with parameters
+    connection.execute(
+        update_statement,
+        {"new_salary": 65000, "new_department": "Sales", "employee_id": 101}
+    )
+
+    # Commit the changes (if not using autocommit)
+    connection.commit()
