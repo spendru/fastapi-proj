@@ -1,0 +1,77 @@
+Ah, in that case, let me modify the pipeline to use the Veracode service connection instead of variables. This is actually a better and more secure approach.
+
+
+
+```yaml
+trigger:
+  - main
+
+variables:
+  - name: PROJECT_NAME
+    value: "your-python-project"
+  - name: BUILD_VERSION
+    value: "1.0.$(Build.BuildId)"
+
+stages:
+  - stage: Build
+    jobs:
+      - job: BuildAndScan
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          # Install Python dependencies
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.x'
+              addToPath: true
+          
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: 'Install Dependencies'
+          
+          # Create source code ZIP for Veracode scanning
+          - task: ArchiveFiles@2
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/source_code.zip'
+              replaceExistingArchive: true
+            displayName: 'Create Source Code ZIP'
+          
+          # Submit to Veracode for scanning using service connection
+          - task: Veracode@3
+            inputs:
+              ConnectionDetailsSelection: 'Service Connection'
+              AnalysisService: 'your-veracode-connection'  # Replace with your service connection name
+              veracodeAppProfile: $(PROJECT_NAME)
+              version: $(BUILD_VERSION)
+              filepath: $(Build.ArtifactStagingDirectory)/source_code.zip
+              failBuildOnPolicyFail: true
+              importResults: true
+              failBuildOnScanError: true
+            displayName: 'Veracode Static Analysis'
+
+```
+
+Key changes I made to use the service connection:
+
+1. Removed the VERACODE_API_ID and VERACODE_API_KEY variables since they're not needed anymore
+2. Updated the Veracode task to use version 3 (`Veracode@3`)
+3. Added service connection configuration:
+   - `ConnectionDetailsSelection: 'Service Connection'`
+   - `AnalysisService: 'your-veracode-connection'`
+
+To use this pipeline:
+
+1. Replace `'your-veracode-connection'` with the name of your Veracode service connection
+2. Update the `PROJECT_NAME` to match your application name
+3. Adjust the `filepath` if your source code is in a specific directory
+
+The service connection approach is more secure because:
+- Credentials are managed centrally
+- Better access control through Azure DevOps
+- No need to handle API credentials in the pipeline variables
+
+Would you like me to help you with any specific configuration or do you need to customize any scanning parameters?
