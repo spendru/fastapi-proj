@@ -1,0 +1,125 @@
+import pandas as pd
+from sqlalchemy import create_engine, text, exc
+from sqlalchemy.orm import sessionmaker
+import os
+
+# (Assuming you have your database connection and engine setup as before)
+
+def fetch_data_with_pandas(
+    db_url: str, table_name: str, columns: list[str]
+) -> pd.DataFrame:
+    """Fetches data into a Pandas DataFrame."""
+    engine = None
+    try:
+        engine = create_engine(db_url)
+        query = text(f"SELECT {', '.join(columns)} FROM {table_name}")
+        Session = sessionmaker(bind=engine)
+        with Session() as session:
+            result = session.execute(query)
+            df = pd.DataFrame(result.fetchall(), columns=columns)
+            return df  # Return the DataFrame
+    except exc.SQLAlchemyError as e:
+        print(f"SQLAlchemy error: {e}")
+        raise  # Re-raise for handling by the caller.
+    finally:
+        if engine:
+            engine.dispose()
+
+def create_test_table(engine, table_name, columns):
+    """Creates a test table and inserts sample data."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {table_name}"))  # Drop if exists for clean test
+            
+            # Construct the CREATE TABLE statement dynamically
+            create_table_sql = f"CREATE TABLE {table_name} ("
+            column_defs = []
+            for col in columns:
+                if col == 'id':
+                    column_defs.append(f"{col} INTEGER PRIMARY KEY")  # Assuming 'id' is an integer primary key
+                else:
+                    column_defs.append(f"{col} VARCHAR(255)") # Other columns as VARCHAR
+            create_table_sql += ", ".join(column_defs) + ")"
+
+            conn.execute(text(create_table_sql))
+
+            conn.execute(text(f"""
+                INSERT INTO {table_name} ({', '.join(columns)}) VALUES
+                (1, 'Value1', 'Desc1'),
+                (2, 'Value2', 'Desc2'),
+                (3, 'Value3', 'Desc3')
+            """))
+            # Use the new way of committing (since SQLAlchemy 2.0)
+            conn.commit()
+    except exc.SQLAlchemyError as e:
+        print(f"Error creating test table: {e}")
+        raise
+
+def main():
+    db_user = os.environ.get("DB_USER", "your_username")  # Use environment variables for security
+    db_password = os.environ.get("DB_PASSWORD", "your_password")
+    db_host = os.environ.get("DB_HOST", "your_rds_endpoint")
+    db_port = os.environ.get("DB_PORT", "5432")  # Default PostgreSQL port
+    db_name = os.environ.get("DB_NAME", "your_database_name")
+
+    db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+    table_name = "my_test_table"
+    columns_to_fetch = ['id', 'data_value', 'description']  # Include all the columns you want
+    engine = create_engine(db_url)
+    create_test_table(engine,table_name,columns_to_fetch)
+
+    try:
+        df = fetch_data_with_pandas(db_url, table_name, columns_to_fetch)
+        if df.empty:
+            print("No data found in the table.")
+            return
+
+        # --- Accessing Data with iterrows() ---
+        print("--- Accessing with iterrows() ---")
+        for index, row in df.iterrows():
+            # 1. Access by Column Name (Corrected and Preferred):
+            print(f"Row {index}:")
+            print(f"  ID: {row['id']}")  # Directly use the column name!
+            print(f"  Data Value: {row['data_value']}")
+            print(f"  Description: {row['description']}")
+
+            # 2. Access by Column Index (Less Readable, but possible):
+            #   (Generally, prefer access by name for clarity)
+            print(f"  ID (by index): {row[0]}")  # 'id' is likely the first column (index 0)
+            print(f"  Data Value (by index): {row[1]}")
+
+        # --- Accessing a Specific Row by Label ---
+        print("\n--- Accessing a Specific Row by Label (if you know the index label) ---")
+        #   If your DataFrame has a custom index (not just 0, 1, 2...), use .loc[]:
+        #   If your 'id' column was set as the index:
+        #   df = df.set_index('id')  <--  If you did this *after* fetching the data
+        #   row_2 = df.loc[2]  # Access the row where the 'id' (index) is 2
+        #   print(f"Data Value for ID 2: {row_2['data_value']}")
+
+        # --- Accessing a Specific Row by Integer Position ---
+        print("\n--- Accessing a Specific Row by Integer Position ---")
+        #   If you want the row at a specific numerical position (0-based), use .iloc[]:
+        first_row = df.iloc[0]  # Get the very first row (regardless of its index label)
+        print(f"Data Value of the First Row: {first_row['data_value']}")
+
+
+        # --- Accessing using .at and iat ---
+        print("\n--- Accessing single values using .at and .iat ---")
+        # .at:  Access a single value by *label* (row label and column name)
+        #   (Only use .at if you have set a custom index, otherwise use .iat)
+        #   df = df.set_index('id')  #  <-- Only if you've set 'id' as the index
+        #   value = df.at[2, 'data_value']  # Row with index label 2, column 'data_value'
+        #   print(f"Value at [2, 'data_value']: {value}")
+
+        # .iat: Access a single value by *integer position* (row and column number)
+        value = df.iat[0, 1]  # First row (0), second column (1) - 'data_value'
+        print(f"Value at [0, 1]: {value}")
+
+    except (exc.SQLAlchemyError, ValueError) as e:
+        print(f"An error occurred: {e}")
+    finally:
+        if engine:
+            engine.dispose()
+if __name__ == "__main__":
+    main()
