@@ -33,12 +33,17 @@ RUN apt-get update && apt-get install -y \
 # Set ODBC environment variables
 ENV PATH="/opt/mssql-tools/bin:${PATH}"
 
+# Install AWS Lambda Runtime Interface Client
+RUN pip install --no-cache-dir awslambdaric
+
 # Install Python dependencies
 RUN pip install --no-cache-dir \
     pyodbc \
     pandas \
     sqlalchemy \
     pymssql
+# Set the entry point for the Lambda function
+ENTRYPOINT ["/usr/local/bin/python", "-m", "awslambdaric"]
 
 # Set the command to run the Lambda function handler
 CMD ["app.lambda_handler"]
