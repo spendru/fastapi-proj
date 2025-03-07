@@ -1,6 +1,6 @@
 FROM public.ecr.aws/lambda/python:3.9
 
-# Install system dependencies, but do NOT remove OpenSSL
+# Install system dependencies (but don't remove OpenSSL)
 RUN yum install -y \
     gcc \
     unixODBC \
@@ -10,21 +10,24 @@ RUN yum install -y \
     make \
     which \
     libffi-devel \
+    krb5-libs \
     curl \
     openssl11 \
     && yum clean all
 
-# Ensure OpenSSL 1.1 is used instead of the default OpenSSL 1.0.2
+# Ensure OpenSSL 1.1 is used instead of OpenSSL 1.0.2
 RUN ln -sf /usr/bin/openssl11 /usr/bin/openssl
 
-# Install Microsoft ODBC Driver for SQL Server
-RUN curl -o /etc/yum.repos.d/mssql-release.repo https://packages.microsoft.com/config/rhel/7/prod.repo \
-    && ACCEPT_EULA=Y yum install -y \
+# Add Microsoft's repository for ODBC drivers
+RUN curl -o /etc/yum.repos.d/mssql-release.repo https://packages.microsoft.com/config/rhel/7/prod.repo
+
+# Install Microsoft ODBC Driver, forcing installation to avoid conflicts
+RUN ACCEPT_EULA=Y yum install -y --nogpgcheck \
     msodbcsql17 \
     mssql-tools \
     && yum clean all
 
-# Verify OpenSSL version (should show OpenSSL 1.1.x)
+# Verify OpenSSL version to ensure correct installation
 RUN openssl version
 
 # Add Microsoft ODBC Driver to PATH
