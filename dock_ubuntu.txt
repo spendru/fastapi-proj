@@ -1,24 +1,26 @@
-FROM public.ecr.aws/lambda/python:3.9-ubuntu
+FROM python:3.9-slim-bullseye
 
-# Install system dependencies required for msodbcsql17
+# Install system dependencies (including gnupg for Microsoft repo key)
 RUN apt-get update && apt-get install -y \
+    gnupg \
     gcc \
     g++ \
     curl \
     unixodbc \
     unixodbc-dev \
     libgssapi-krb5-2 \
-    libssl1.1 \
+    libssl3 \
     odbcinst \
     ca-certificates \
     apt-transport-https \
-    software-properties-common
+    software-properties-common \
+    && apt-get clean
 
 # Add Microsoft repository for ODBC drivers
-RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
-    && add-apt-repository "$(curl -fsSL https://packages.microsoft.com/config/ubuntu/20.04/prod.list)"
+RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | tee /etc/apt/trusted.gpg.d/microsoft.asc \
+    && echo "deb [arch=amd64] https://packages.microsoft.com/debian/11/prod bullseye main" > /etc/apt/sources.list.d/mssql-release.list
 
-# Install Microsoft ODBC Driver for SQL Server
+# Install Microsoft ODBC Driver for SQL Server (including accepting the EULA)
 RUN ACCEPT_EULA=Y apt-get update && apt-get install -y \
     msodbcsql17 \
     mssql-tools \
