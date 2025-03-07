@@ -9,9 +9,14 @@ RUN yum install -y \
     gzip \
     make \
     which \
-    openssl \
     libffi-devel \
+    curl \
     && yum clean all
+
+# Install OpenSSL 1.1 (instead of default OpenSSL 1.0.2)
+RUN yum remove -y openssl openssl-libs \
+    && yum install -y openssl11 \
+    && ln -s /usr/bin/openssl11 /usr/bin/openssl
 
 # Install Microsoft ODBC Driver for SQL Server
 RUN curl -o /etc/yum.repos.d/mssql-release.repo https://packages.microsoft.com/config/rhel/7/prod.repo \
@@ -19,6 +24,9 @@ RUN curl -o /etc/yum.repos.d/mssql-release.repo https://packages.microsoft.com/c
     msodbcsql17 \
     mssql-tools \
     && yum clean all
+
+# Verify OpenSSL version (Ensure OpenSSL 1.1 is being used)
+RUN openssl version
 
 # Add Microsoft ODBC Driver to PATH
 ENV PATH="/opt/mssql-tools/bin:${PATH}"
