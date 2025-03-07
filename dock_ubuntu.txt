@@ -1,0 +1,38 @@
+FROM public.ecr.aws/lambda/python:3.9-ubuntu
+
+# Install system dependencies required for msodbcsql17
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    unixodbc \
+    unixodbc-dev \
+    libgssapi-krb5-2 \
+    libssl1.1 \
+    odbcinst \
+    ca-certificates \
+    apt-transport-https \
+    software-properties-common
+
+# Add Microsoft repository for ODBC drivers
+RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
+    && add-apt-repository "$(curl -fsSL https://packages.microsoft.com/config/ubuntu/20.04/prod.list)"
+
+# Install Microsoft ODBC Driver for SQL Server
+RUN ACCEPT_EULA=Y apt-get update && apt-get install -y \
+    msodbcsql17 \
+    mssql-tools \
+    && apt-get clean
+
+# Set ODBC environment variables
+ENV PATH="/opt/mssql-tools/bin:${PATH}"
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    pyodbc \
+    pandas \
+    sqlalchemy \
+    pymssql
+
+# Set the command to run the Lambda function handler
+CMD ["app.lambda_handler"]
