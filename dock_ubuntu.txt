@@ -1,5 +1,9 @@
 FROM python:3.9-slim-bullseye
 
+# Set environment variables for non-interactive installation
+ENV ACCEPT_EULA=Y
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Install system dependencies (including gnupg for Microsoft repo key)
 RUN apt-get update && apt-get install -y \
     gnupg \
@@ -9,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     unixodbc \
     unixodbc-dev \
     libgssapi-krb5-2 \
-    libssl3 \
+    libssl1.1 \
     odbcinst \
     ca-certificates \
     apt-transport-https \
@@ -21,7 +25,7 @@ RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | tee /etc/apt/
     && echo "deb [arch=amd64] https://packages.microsoft.com/debian/11/prod bullseye main" > /etc/apt/sources.list.d/mssql-release.list
 
 # Install Microsoft ODBC Driver for SQL Server (including accepting the EULA)
-RUN ACCEPT_EULA=Y apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y \
     msodbcsql17 \
     mssql-tools \
     && apt-get clean
