@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template with SQS FIFO Lambda and Amplify App Configuration'
+
+Parameters:
+  # SQS and Lambda Parameters
+  QueueName:
+    Type: String
+    Default: MyQueue.fifo
+    Description: Name of the FIFO queue (must end with .fifo)
+
+  LambdaFunctionName:
+    Type: String
+    Default: SQSProcessorFunction
+    Description: Name of the Lambda function that will process SQS messages
+
+  ContainerImageUri:
+    Type: String
+    Description: URI of the container image in ECR (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-lambda-image:latest)
+
+  ExistingLambdaExecutionRoleArn:
+    Type: String
+    Description: ARN of the existing Lambda execution role
+
+  ErrorQueueArn:
+    Type: String
+    Description: ARN of the existing error queue (Dead Letter Queue)
+
+  # Amplify Configuration Parameters
+  AmplifyAppName:
+    Type: String
+    Description: Name of the Amplify Application
+
+  AmplifyRepository:
+    Type: String
+    Description: GitHub repository URL (e.g., https://github.com/username/repo)
+
+  AmplifyBranch:
+    Type: String
+    Default: main
+    Description: Branch to be deployed
+
+  CustomDomainName:
+    Type: String
+    Description: Custom domain name for the Amplify app (e.g., www.example.com)
+
+  GitHubOAuthToken:
+    Type: String
+    Description: GitHub OAuth token for repository access
+    NoEcho: true
+
+Resources:
+  # SQS FIFO Queue (Previous Implementation)
+  SQSFifoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref QueueName
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy: 
+        deadLetterTargetArn: !Ref ErrorQueueArn
+        maxReceiveCount: 1
+
+  # Lambda Function (Previous Implementation)
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ContainerImageUri
+      Role: !Ref ExistingLambdaExecutionRoleArn
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref SQSFifoQueue
+          ERROR_QUEUE_URL: !GetAtt SQSFifoQueue.QueueName
+      Timeout: 60
+      MemorySize: 128
+
+  # Lambda Event Source Mapping
+  LambdaSQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 0
+      Enabled: true
+      EventSourceArn: !GetAtt SQSFifoQueue.Arn
+      FunctionName: !GetAtt LambdaFunction.Arn
+
+  # Amplify App
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Ref AmplifyAppName
+      Repository: !Ref AmplifyRepository
+      AccessToken: !Ref GitHubOAuthToken
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: build
+            files:
+              - '**/*'
+      Platform: Web
+
+  # Amplify Branch
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref AmplifyBranch
+      Stage: PRODUCTION
+      EnableAutoBuild: true
+      EnablePullRequestPreview: true
+
+  # Amplify Domain
+  AmplifyDomain:
+    Type: AWS::Amplify::Domain
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      DomainName: !Ref CustomDomainName
+      SubDomainSettings:
+        - Prefix: ''
+          BranchName: !Ref AmplifyBranch
+        - Prefix: 'www'
+          BranchName: !Ref AmplifyBranch
+
+Outputs:
+  # SQS Outputs
+  QueueURL:
+    Description: URL of the SQS FIFO queue
+    Value: !Ref SQSFifoQueue
+
+  QueueARN:
+    Description: ARN of the SQS FIFO queue
+    Value: !GetAtt SQSFifoQueue.Arn
+    
+  LambdaFunctionARN:
+    Description: ARN of the Lambda function
+    Value: !GetAtt LambdaFunction.Arn
+
+  # Amplify Outputs
+  AmplifyAppId:
+    Description: Amplify Application ID
+    Value: !GetAtt AmplifyApp.AppId
+
+  AmplifyAppARN:
+    Description: Amplify Application ARN
+    Value: !GetAtt AmplifyApp.AppArn
+
+  AmplifyDefaultDomain:
+    Description: Amplify App Default Domain
+    Value: !GetAtt AmplifyApp.DefaultDomain
+
+  AmplifyBranchURL:
+    Description: Amplify Branch Deployment URL
+    Value: !Sub https://${AmplifyBranch}.${AmplifyApp.DefaultDomain}
