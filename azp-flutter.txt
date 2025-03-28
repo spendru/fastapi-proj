@@ -1,0 +1,105 @@
+# azure-pipelines.yml
+
+trigger:
+  branches:
+    include:
+      - main # Or your primary branch (e.g., master, develop)
+
+pool:
+  vmImage: 'ubuntu-latest' # Use a Linux-based image as the host for the Docker container
+
+# Define variables - Consider using Variable Groups for sensitive/environment-specific values
+variables:
+  # --- Configuration ---
+  flutterDockerImage: 'cirrusci/flutter:3.19.6' # Specify your desired Flutter version tag
+  awsServiceConnection: 'MyAWSConnection'      # Name of your AWS Service Connection in Azure DevOps
+  awsRegion: 'us-east-1'                     # Target AWS Region for your S3 bucket
+  s3BucketName: 'your-s3-bucket-name'          # Name of your target S3 bucket
+  # --- Build Output ---
+  buildOutputPath: '$(Build.SourcesDirectory)/build/web'
+  artifactName: 'flutter_webapp'
+
+stages:
+- stage: Build
+  displayName: 'Build Flutter Web App'
+  jobs:
+  - job: BuildJob
+    displayName: 'Build using Docker Container'
+    # Define the container to run the job steps inside
+    container: $[ variables['flutterDockerImage'] ]
+    steps:
+      # Step 1: Checkout code (Azure DevOps automatically mounts the source code into the container)
+      - checkout: self
+        clean: true # Optional: Start with a clean directory
+
+      # Step 2: (Optional) Verify Flutter environment inside the container
+      - script: flutter doctor -v
+        displayName: 'Verify Flutter Setup'
+
+      # Step 3: Get Flutter dependencies
+      - script: flutter pub get
+        displayName: 'Get Flutter Dependencies'
+
+      # Step 4: Build the Flutter Web App
+      # Use forward slashes for paths inside the Linux container
+      # Use --release for an optimized production build
+      - script: flutter build web -t lib/main.dart --release
+        displayName: 'Build Flutter Web App (--release)'
+
+      # Step 5: Archive the build output (optional but good practice before publishing)
+      # This step runs *inside* the container. Paths are relative to the workspace.
+      - task: ArchiveFiles@2
+        displayName: 'Archive Web App Build Output'
+        inputs:
+          rootFolderOrFile: '$(buildOutputPath)' # Path to the build/web directory
+          includeRootFolder: false # Don't include the 'build/web' folder itself in the archive
+          archiveType: 'zip'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/$(artifactName).zip' # Standard staging directory
+          replaceExistingArchive: true
+
+      # Step 6: Publish the build artifact (the zip file) to Azure Pipelines
+      # This makes the artifact available to subsequent stages/jobs
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Web App Artifact'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(artifactName).zip'
+          ArtifactName: $(artifactName) # Name the artifact for later download
+          publishLocation: 'Container' # Specifies the artifact is published from the container
+
+- stage: Deploy
+  displayName: 'Deploy to AWS S3'
+  dependsOn: Build # Ensure Build stage completes successfully first
+  condition: succeeded() # Only run if the Build stage succeeded
+  jobs:
+  - job: DeployJob
+    displayName: 'Upload Artifact to S3'
+    # This job runs on the agent host, not inside the Flutter container
+    steps:
+      # Step 1: Download the build artifact published by the Build stage
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download Web App Artifact'
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: $(artifactName) # Name matches the published artifact
+          downloadPath: '$(System.ArtifactsDirectory)' # Standard download location
+
+      # Step 2: Extract the downloaded artifact (zip file)
+      - task: ExtractFiles@1
+        displayName: 'Extract Web App Files'
+        inputs:
+          archiveFilePatterns: '$(System.ArtifactsDirectory)/$(artifactName)/$(artifactName).zip'
+          destinationFolder: '$(System.ArtifactsDirectory)/$(artifactName)/extracted' # Extract to a subfolder
+          cleanDestinationFolder: true
+
+      # Step 3: Upload the extracted files to AWS S3
+      - task: AWSS3Upload@1
+        displayName: 'Upload Web App to AWS S3'
+        inputs:
+          awsCredentials: $(awsServiceConnection) # Reference the Service Connection
+          regionName: $(awsRegion)
+          bucketName: $(s3BucketName)
+          sourceFolder: '$(System.ArtifactsDirectory)/$(artifactName)/extracted' # Path to the extracted web app files
+          globExpressions: '**/*' # Upload all files and folders recursively
+          # targetFolder: '' # Optional: Specify a prefix (subfolder) in the S3 bucket
+          # Overwrite: true # Optional: Set to true to overwrite existing files in S3
