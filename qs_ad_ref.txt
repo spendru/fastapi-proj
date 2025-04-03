@@ -1,0 +1,284 @@
+import json
+import logging
+import os
+import boto3
+from botocore.exceptions import ClientError
+import msal  # Must be included in the Lambda deployment package
+import requests # Must be included in the Lambda deployment package
+
+# --- Logging Setup ---
+# Lambda automatically configures root logger, but we can set the level
+logger = logging.getLogger()
+log_level = os.environ.get("LOG_LEVEL", "INFO").upper() # Set log level via Env Var if needed
+logger.setLevel(log_level)
+logger.info("Lambda function initializing...")
+
+# --- Configuration (from Environment Variables) ---
+# Set these Environment Variables in your Lambda function configuration
+AZURE_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID")
+AZURE_TENANT_ID = os.environ.get("AZURE_TENANT_ID")
+AZURE_GROUP_ID = os.environ.get("AZURE_GROUP_ID")
+# Name or ARN of the secret in AWS Secrets Manager containing the Azure Client Secret
+AZURE_CLIENT_SECRET_NAME = os.environ.get("AZURE_CLIENT_SECRET_NAME")
+
+AWS_ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID")
+# AWS_REGION is automatically available via AWS_DEFAULT_REGION or discovered by Boto3
+AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", boto3.session.Session().region_name)
+# This MUST be the ARN of an existing IAM User or Role in your AWS account
+QUICKSIGHT_IAM_ARN = os.environ.get("QUICKSIGHT_IAM_ARN")
+QUICKSIGHT_USER_ROLE = os.environ.get("QUICKSIGHT_USER_ROLE", "READER") # Default to READER
+QUICKSIGHT_NAMESPACE = os.environ.get("QUICKSIGHT_NAMESPACE", "default") # Default to 'default'
+
+# Specify the Azure AD attributes you want to retrieve
+AZURE_ATTRIBUTES_TO_SELECT = [
+    "id",
+    "displayName",
+    "userPrincipalName",
+    "mail",
+]
+
+# --- Helper Function to Get Secret ---
+def get_secret(secret_name, region_name):
+    """Retrieves a secret from AWS Secrets Manager."""
+    logger.info(f"Attempting to retrieve secret: {secret_name}")
+    session = boto3.session.Session()
+    client = session.client(service_name='secretsmanager', region_name=region_name)
+
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+        logger.info(f"Successfully retrieved secret: {secret_name}")
+    except ClientError as e:
+        logger.error(f"Error retrieving secret {secret_name}: {e}")
+        # Raise the error to halt execution if secret is essential
+        raise e
+    else:
+        # Secrets Manager stores secrets as key-value pairs or plain text
+        # Assuming the secret is stored as plain text (the client secret itself)
+        if 'SecretString' in get_secret_value_response:
+            return get_secret_value_response['SecretString']
+        else:
+            # Handle binary secrets if necessary, though unlikely for a client secret
+            logger.warning(f"Secret {secret_name} does not contain SecretString.")
+            return None # Or handle as appropriate
+
+# --- Azure Functions (Mostly Unchanged) ---
+def get_azure_ad_access_token(client_id, client_secret, tenant_id):
+    """Acquires an Azure AD access token using client credentials flow."""
+    logger.info("Attempting to acquire Azure AD access token...")
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    app = msal.ConfidentialClientApplication(
+        client_id, authority=authority,
+        client_credential=client_secret,
+    )
+    scope = ["https://graph.microsoft.com/.default"]
+    result = app.acquire_token_silent(scope, account=None)
+    if not result:
+        logger.info("No suitable Azure AD token in cache. Acquiring a new token...")
+        result = app.acquire_token_for_client(scopes=scope)
+
+    if "access_token" in result:
+        logger.info("Azure AD access token acquired successfully.")
+        return result['access_token']
+    else:
+        logger.error(f"Error acquiring Azure AD token: {result.get('error')}")
+        logger.error(f"Error description: {result.get('error_description')}")
+        raise Exception("Failed to acquire Azure AD access token")
+
+def get_azure_group_members(access_token, group_id, attributes):
+    """Retrieves members of a specific Azure AD group with selected attributes."""
+    members = []
+    select_query = ",".join(attributes)
+    graph_api_endpoint = "https://graph.microsoft.com/v1.0"
+    headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+    # Use ConsistencyLevel header for advanced query capabilities like $count on directory objects if needed later
+    # headers['ConsistencyLevel'] = 'eventual'
+    url = f"{graph_api_endpoint}/groups/{group_id}/members?$select={select_query}&$top=999"
+
+    logger.info(f"Fetching Azure AD members for group ID: {group_id}...")
+    page_count = 0
+    while url:
+        page_count += 1
+        logger.info(f"Fetching Azure AD members page {page_count} from {url.split('?')[0]}...")
+        try:
+            response = requests.get(url, headers=headers, timeout=30) # Add timeout
+            response.raise_for_status()
+            data = response.json()
+            current_page_members = data.get("value", [])
+            logger.info(f"Retrieved {len(current_page_members)} members on page {page_count}.")
+            members.extend(current_page_members)
+            url = data.get("@odata.nextLink") # Get URL for next page
+            if not url:
+                 logger.info("No more Azure AD member pages.")
+
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout while fetching Azure members page {page_count}.")
+            raise # Or implement retry logic
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HTTP Request failed while fetching Azure members: {e}")
+            try:
+                logger.error(f"Error details from API: {response.text}") # Log full text on error
+            except: pass
+            raise
+        except json.JSONDecodeError:
+            logger.error(f"Failed to decode JSON response from Azure: {response.text[:500]}...")
+            raise
+
+    logger.info(f"Successfully retrieved {len(members)} Azure AD members in total.")
+    return members
+
+# --- AWS QuickSight Function (Mostly Unchanged) ---
+def register_quicksight_user(aws_account_id, region, iam_arn, email, session_name, user_role, namespace='default'):
+    """Registers a user in AWS QuickSight using IAM identity type."""
+    logger.info(f"Attempting to register QuickSight user: Email='{email}', SessionName='{session_name}', IamArn='{iam_arn}'")
+    # Boto3 client creation can be outside the loop if function is called multiple times per invocation
+    # but here it's fine as it's called within the main loop
+    quicksight_client = boto3.client('quicksight', region_name=region)
+
+    try:
+        response = quicksight_client.register_user(
+            AwsAccountId=aws_account_id,
+            Namespace=namespace,
+            IdentityType='IAM',
+            IamArn=iam_arn,
+            SessionName=session_name,
+            Email=email,
+            UserRole=user_role
+        )
+        # Extract the registered user's ARN for logging confirmation
+        user_arn = response.get('User', {}).get('Arn', 'N/A')
+        logger.info(f"Successfully registered QuickSight user: Email='{email}'. User ARN: {user_arn}")
+        return True, "Registered successfully"
+
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code")
+        error_message = e.response.get("Error", {}).get("Message", str(e))
+        if error_code == 'ResourceExistsException':
+            logger.warning(f"QuickSight user already exists for Email='{email}', IamArn='{iam_arn}'. Skipping registration.")
+            return False, "User already exists"
+        else:
+            logger.error(f"AWS Error registering QuickSight user '{email}'. Code: {error_code}, Message: {error_message}")
+            return False, f"AWS Error: {error_code}"
+    except Exception as e:
+        logger.error(f"An unexpected error occurred registering QuickSight user '{email}': {e}")
+        return False, f"Unexpected Error: {str(e)}"
+
+# --- Lambda Handler ---
+def lambda_handler(event, context):
+    """
+    Main Lambda execution entry point.
+    Fetches Azure AD group members and registers them in QuickSight.
+    """
+    logger.info(f"Lambda Request ID: {context.aws_request_id}. Event: {json.dumps(event)}")
+
+    # --- Validate Configuration ---
+    config_errors = []
+    if not AZURE_CLIENT_ID: config_errors.append("AZURE_CLIENT_ID")
+    if not AZURE_TENANT_ID: config_errors.append("AZURE_TENANT_ID")
+    if not AZURE_GROUP_ID: config_errors.append("AZURE_GROUP_ID")
+    if not AZURE_CLIENT_SECRET_NAME: config_errors.append("AZURE_CLIENT_SECRET_NAME")
+    if not AWS_ACCOUNT_ID: config_errors.append("AWS_ACCOUNT_ID")
+    if not QUICKSIGHT_IAM_ARN: config_errors.append("QUICKSIGHT_IAM_ARN")
+    if not AWS_REGION: config_errors.append("AWS Region could not be determined")
+
+    if config_errors:
+        error_msg = f"Missing critical configuration environment variables: {', '.join(config_errors)}"
+        logger.critical(error_msg)
+        # Return failure response for critical config errors
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'message': error_msg, 'registered': 0, 'skipped': 0, 'failed': 0})
+        }
+
+    registered_count = 0
+    skipped_count = 0
+    failed_count = 0
+    group_members = [] # Initialize in case early steps fail
+
+    try:
+        # 1. Get Azure Client Secret from Secrets Manager
+        azure_client_secret = get_secret(AZURE_CLIENT_SECRET_NAME, AWS_REGION)
+        if not azure_client_secret:
+             # get_secret logs the error, raise to stop processing
+             raise ValueError(f"Failed to retrieve Azure Client Secret from {AZURE_CLIENT_SECRET_NAME}")
+
+        # 2. Get Azure AD Token
+        azure_token = get_azure_ad_access_token(AZURE_CLIENT_ID, azure_client_secret, AZURE_TENANT_ID)
+
+        # 3. Get Azure AD Group Members
+        group_members = get_azure_group_members(azure_token, AZURE_GROUP_ID, AZURE_ATTRIBUTES_TO_SELECT)
+
+        logger.info(f"\n--- Starting QuickSight Registration Process for {len(group_members)} members ---")
+
+        # 4. Process each member for QuickSight registration
+        for member in group_members:
+            member_email = member.get('mail')
+            member_display_name = member.get('displayName')
+            member_upn = member.get('userPrincipalName')
+            odata_type = member.get('@odata.type', '').lower()
+
+            # Determine SessionName (UPN > DisplayName > Email prefix)
+            session_name = member_upn or member_display_name or (member_email.split('@')[0] if member_email else None)
+
+            # Filter: Only process users with email and a valid session name candidate
+            if 'user' in odata_type and member_email and session_name:
+                logger.debug(f"Processing member: Email='{member_email}', SessionName='{session_name}', Type='{odata_type}'")
+
+                # 5. Register user in QuickSight
+                success, message = register_quicksight_user(
+                    aws_account_id=AWS_ACCOUNT_ID,
+                    region=AWS_REGION,
+                    iam_arn=QUICKSIGHT_IAM_ARN,
+                    email=member_email,
+                    session_name=session_name,
+                    user_role=QUICKSIGHT_USER_ROLE,
+                    namespace=QUICKSIGHT_NAMESPACE
+                )
+                if success:
+                    registered_count += 1
+                elif message == "User already exists":
+                     skipped_count += 1
+                else: # Any other failure reason
+                     failed_count += 1
+                     # Specific error logged within register_quicksight_user
+
+            elif not member_email:
+                logger.warning(f"Skipping member {member.get('id')} ('{member_display_name}') due to missing email address.")
+                skipped_count += 1
+            elif not session_name:
+                 logger.warning(f"Skipping member {member.get('id')} ('{member_display_name}') as couldn't determine a SessionName (UPN, DisplayName, or Email Prefix).")
+                 skipped_count += 1
+            else:
+                logger.info(f"Skipping member {member.get('id')} ('{member_display_name}') as it's not a user object ('{odata_type}')")
+                skipped_count += 1
+
+        logger.info("Processing complete.")
+        final_status_code = 200
+
+    except Exception as e:
+        # Catch exceptions from token acquisition, member fetching, or unexpected errors
+        logger.critical(f"Lambda execution failed: {e}", exc_info=True) # Log traceback
+        failed_count = len(group_members) - registered_count - skipped_count # Mark remaining as failed
+        final_status_code = 500
+        # Return failure response for major processing errors
+        return {
+            'statusCode': final_status_code,
+            'body': json.dumps({
+                'message': f"Critical error during execution: {str(e)}",
+                'registered': registered_count,
+                'skipped': skipped_count,
+                'failed': failed_count # Can be approximate if error happened mid-loop
+            })
+        }
+
+    # --- Return Success Summary ---
+    summary_message = f"Execution Summary: Registered={registered_count}, Skipped={skipped_count}, Failed={failed_count}"
+    logger.info(summary_message)
+    return {
+        'statusCode': final_status_code,
+        'body': json.dumps({
+            'message': summary_message,
+            'registered': registered_count,
+            'skipped': skipped_count,
+            'failed': failed_count
+        })
+    }
