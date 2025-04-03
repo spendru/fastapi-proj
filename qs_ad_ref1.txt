@@ -1,0 +1,385 @@
+import json
+import logging
+import os
+import boto3
+from botocore.exceptions import ClientError
+import msal  # Must be included in the Lambda deployment package
+import requests # Must be included in the Lambda deployment package
+
+# --- Logging Setup ---
+logger = logging.getLogger()
+log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logger.setLevel(log_level)
+logger.info("Lambda function initializing...")
+
+# --- Configuration (from Environment Variables) ---
+# Azure AD Config
+AZURE_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID")
+AZURE_TENANT_ID = os.environ.get("AZURE_TENANT_ID")
+AZURE_GROUP_ID = os.environ.get("AZURE_GROUP_ID")
+AZURE_CLIENT_SECRET_NAME = os.environ.get("AZURE_CLIENT_SECRET_NAME")
+
+# AWS Config
+AWS_ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID")
+AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", boto3.session.Session().region_name)
+
+# QuickSight Config
+QUICKSIGHT_IAM_ARN = os.environ.get("QUICKSIGHT_IAM_ARN") # ARN for IAM identity association
+QUICKSIGHT_USER_ROLE = os.environ.get("QUICKSIGHT_USER_ROLE", "READER")
+QUICKSIGHT_NAMESPACE = os.environ.get("QUICKSIGHT_NAMESPACE", "default")
+QUICKSIGHT_TARGET_GROUP_NAME = os.environ.get("QUICKSIGHT_TARGET_GROUP_NAME") # New: Target group
+
+# Azure AD Attributes to fetch
+AZURE_ATTRIBUTES_TO_SELECT = [
+    "id",
+    "displayName",
+    "userPrincipalName",
+    "mail",
+]
+
+# --- Boto3 Clients (reuse if possible) ---
+# Creating clients outside the handler can sometimes improve performance
+# by reusing connections across invocations, but be mindful of potential
+# state issues if not designed carefully. For simplicity here, we keep them local.
+# secrets_manager_client = boto3.client('secretsmanager', region_name=AWS_REGION)
+# quicksight_client = boto3.client('quicksight', region_name=AWS_REGION)
+
+
+# --- Helper Function to Get Secret ---
+def get_secret(secret_name, region_name):
+    """Retrieves a secret from AWS Secrets Manager."""
+    logger.info(f"Attempting to retrieve secret: {secret_name}")
+    session = boto3.session.Session()
+    client = session.client(service_name='secretsmanager', region_name=region_name)
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+        logger.info(f"Successfully retrieved secret: {secret_name}")
+        if 'SecretString' in get_secret_value_response:
+            return get_secret_value_response['SecretString']
+        else:
+            logger.warning(f"Secret {secret_name} does not contain SecretString.")
+            return None
+    except ClientError as e:
+        logger.error(f"Error retrieving secret {secret_name}: {e}")
+        raise e # Re-raise critical error
+
+# --- Azure Functions ---
+def get_azure_ad_access_token(client_id, client_secret, tenant_id):
+    """Acquires an Azure AD access token using client credentials flow."""
+    logger.info("Attempting to acquire Azure AD access token...")
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    app = msal.ConfidentialClientApplication(
+        client_id, authority=authority, client_credential=client_secret,
+    )
+    scope = ["https://graph.microsoft.com/.default"]
+    result = app.acquire_token_silent(scope, account=None)
+    if not result:
+        logger.info("No suitable Azure AD token in cache. Acquiring a new token...")
+        result = app.acquire_token_for_client(scopes=scope)
+
+    if "access_token" in result:
+        logger.info("Azure AD access token acquired successfully.")
+        return result['access_token']
+    else:
+        logger.error(f"Error acquiring Azure AD token: {result.get('error')}")
+        logger.error(f"Error description: {result.get('error_description')}")
+        raise Exception("Failed to acquire Azure AD access token")
+
+def get_azure_group_members(access_token, group_id, attributes):
+    """Retrieves members of a specific Azure AD group with selected attributes."""
+    members = []
+    select_query = ",".join(attributes)
+    graph_api_endpoint = "https://graph.microsoft.com/v1.0"
+    headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+    url = f"{graph_api_endpoint}/groups/{group_id}/members?$select={select_query}&$top=999"
+    logger.info(f"Fetching Azure AD members for group ID: {group_id}...")
+    page_count = 0
+    while url:
+        page_count += 1
+        logger.info(f"Fetching Azure AD members page {page_count}...")
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            current_page_members = data.get("value", [])
+            logger.info(f"Retrieved {len(current_page_members)} members on page {page_count}.")
+            members.extend(current_page_members)
+            url = data.get("@odata.nextLink")
+            if not url:
+                 logger.info("No more Azure AD member pages.")
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout while fetching Azure members page {page_count}.")
+            raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HTTP Request failed fetching Azure members: {e}")
+            try: logger.error(f"Error details: {response.text}")
+            except: pass
+            raise
+        except json.JSONDecodeError:
+            logger.error(f"Failed to decode JSON from Azure: {response.text[:500]}...")
+            raise
+    logger.info(f"Successfully retrieved {len(members)} Azure AD members.")
+    return members
+
+# --- AWS QuickSight Functions ---
+def register_quicksight_user(aws_account_id, region, iam_arn, email, session_name, user_role, namespace='default'):
+    """Registers a user in AWS QuickSight using IAM identity type.
+       Returns: (Boolean success, String message | Dict user_details)
+    """
+    logger.info(f"Registering QuickSight user: Email='{email}', SessionName='{session_name}', IamArn='{iam_arn}'")
+    quicksight_client = boto3.client('quicksight', region_name=region)
+    try:
+        response = quicksight_client.register_user(
+            AwsAccountId=aws_account_id, Namespace=namespace, IdentityType='IAM',
+            IamArn=iam_arn, SessionName=session_name, Email=email, UserRole=user_role
+        )
+        user_details = response.get('User', {})
+        user_arn = user_details.get('Arn', 'N/A')
+        user_name = user_details.get('UserName', 'N/A') # Get UserName
+        logger.info(f"Successfully registered QuickSight user: Email='{email}'. ARN: {user_arn}, UserName: {user_name}")
+        # Return the user details dict on success
+        return True, user_details
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code")
+        error_message = e.response.get("Error", {}).get("Message", str(e))
+        if error_code == 'ResourceExistsException':
+            logger.warning(f"QuickSight user already exists: Email='{email}', IamArn='{iam_arn}'.")
+            # Indicate user exists, but don't return user details yet
+            return False, "User already exists"
+        else:
+            logger.error(f"AWS Error registering QuickSight user '{email}'. Code: {error_code}, Msg: {error_message}")
+            return False, f"AWS Error: {error_code}"
+    except Exception as e:
+        logger.error(f"Unexpected error registering QuickSight user '{email}': {e}")
+        return False, f"Unexpected Error: {str(e)}"
+
+def get_quicksight_user_details(aws_account_id, region, user_name, namespace='default'):
+    """Describes a QuickSight user to get their details, especially UserName and ARN.
+       Requires the QuickSight UserName (often derived from IAM ARN / SessionName).
+       Returns: Dict user_details or None if not found/error.
+    """
+    logger.info(f"Describing QuickSight user: UserName='{user_name}'")
+    quicksight_client = boto3.client('quicksight', region_name=region)
+    try:
+        response = quicksight_client.describe_user(
+            UserName=user_name, # Use UserName to describe
+            AwsAccountId=aws_account_id,
+            Namespace=namespace
+        )
+        user_details = response.get('User')
+        if user_details:
+            logger.info(f"Successfully described QuickSight user: UserName='{user_name}'. ARN: {user_details.get('Arn')}")
+            return user_details
+        else:
+            logger.error(f"Describe user response did not contain User details for UserName='{user_name}'. Response: {response}")
+            return None
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code")
+        if error_code == 'ResourceNotFoundException':
+            logger.error(f"QuickSight user not found: UserName='{user_name}'.")
+        else:
+            logger.error(f"AWS Error describing QuickSight user '{user_name}'. Code: {error_code}, Msg: {e.response.get('Error', {}).get('Message', str(e))}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error describing QuickSight user '{user_name}': {e}")
+        return None
+
+def add_user_to_quicksight_group(aws_account_id, region, group_name, user_name, namespace='default'):
+    """Adds a user to a QuickSight group. Requires the QuickSight UserName.
+       Returns: (Boolean success, String message)
+    """
+    logger.info(f"Adding QuickSight user '{user_name}' to group '{group_name}'")
+    quicksight_client = boto3.client('quicksight', region_name=region)
+    try:
+        quicksight_client.create_group_membership(
+            MemberName=user_name, # API takes UserName
+            GroupName=group_name,
+            AwsAccountId=aws_account_id,
+            Namespace=namespace
+        )
+        logger.info(f"Successfully added user '{user_name}' to group '{group_name}'.")
+        return True, "Added successfully"
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code")
+        error_message = e.response.get("Error", {}).get("Message", str(e))
+        if error_code == 'ResourceExistsException':
+            logger.warning(f"User '{user_name}' is already a member of group '{group_name}'.")
+            return False, "User already in group"
+        elif error_code == 'ResourceNotFoundException':
+            logger.error(f"Error adding user to group: User '{user_name}' or Group '{group_name}' not found.")
+            return False, f"ResourceNotFoundException: {error_message}"
+        else:
+            logger.error(f"AWS Error adding user '{user_name}' to group '{group_name}'. Code: {error_code}, Msg: {error_message}")
+            return False, f"AWS Error: {error_code}"
+    except Exception as e:
+        logger.error(f"Unexpected error adding user '{user_name}' to group '{group_name}': {e}")
+        return False, f"Unexpected Error: {str(e)}"
+
+# --- Lambda Handler ---
+def lambda_handler(event, context):
+    """
+    Main Lambda execution entry point. Fetches Azure AD group members,
+    registers them in QuickSight, and adds them to a QuickSight group.
+    """
+    logger.info(f"Lambda Request ID: {context.aws_request_id}. Event: {json.dumps(event)}")
+
+    # --- Validate Configuration ---
+    config_errors = []
+    if not AZURE_CLIENT_ID: config_errors.append("AZURE_CLIENT_ID")
+    if not AZURE_TENANT_ID: config_errors.append("AZURE_TENANT_ID")
+    if not AZURE_GROUP_ID: config_errors.append("AZURE_GROUP_ID")
+    if not AZURE_CLIENT_SECRET_NAME: config_errors.append("AZURE_CLIENT_SECRET_NAME")
+    if not AWS_ACCOUNT_ID: config_errors.append("AWS_ACCOUNT_ID")
+    if not QUICKSIGHT_IAM_ARN: config_errors.append("QUICKSIGHT_IAM_ARN")
+    if not QUICKSIGHT_TARGET_GROUP_NAME: config_errors.append("QUICKSIGHT_TARGET_GROUP_NAME") # Check new variable
+    if not AWS_REGION: config_errors.append("AWS Region could not be determined")
+
+    if config_errors:
+        error_msg = f"Missing critical config env vars: {', '.join(config_errors)}"
+        logger.critical(error_msg)
+        return {'statusCode': 400, 'body': json.dumps({'message': error_msg})}
+
+    # --- Initialize Counters ---
+    reg_success_count = 0
+    reg_exists_count = 0
+    reg_failed_count = 0
+    group_add_success_count = 0
+    group_add_exists_count = 0
+    group_add_failed_count = 0
+    skipped_count = 0 # Users skipped due to no email, not user type, etc.
+    total_processed = 0
+
+    group_members = []
+
+    try:
+        # 1. Get Azure Client Secret
+        azure_client_secret = get_secret(AZURE_CLIENT_SECRET_NAME, AWS_REGION)
+        if not azure_client_secret:
+             raise ValueError(f"Failed to retrieve Azure Client Secret from {AZURE_CLIENT_SECRET_NAME}")
+
+        # 2. Get Azure AD Token
+        azure_token = get_azure_ad_access_token(AZURE_CLIENT_ID, azure_client_secret, AZURE_TENANT_ID)
+
+        # 3. Get Azure AD Group Members
+        group_members = get_azure_group_members(azure_token, AZURE_GROUP_ID, AZURE_ATTRIBUTES_TO_SELECT)
+        total_processed = len(group_members)
+        logger.info(f"\n--- Starting Processing for {total_processed} members ---")
+
+        # 4. Process each member
+        for member in group_members:
+            member_email = member.get('mail')
+            member_display_name = member.get('displayName')
+            member_upn = member.get('userPrincipalName')
+            odata_type = member.get('@odata.type', '').lower()
+
+            # Determine SessionName (UPN > DisplayName > Email prefix)
+            session_name = member_upn or member_display_name or (member_email.split('@')[0] if member_email else None)
+
+            # Filter: Only process users with email and a valid session name candidate
+            if 'user' in odata_type and member_email and session_name:
+                logger.debug(f"Processing member: Email='{member_email}', SessionName='{session_name}'")
+
+                # 5. Register or check user existence
+                reg_success, reg_result = register_quicksight_user(
+                    aws_account_id=AWS_ACCOUNT_ID, region=AWS_REGION, iam_arn=QUICKSIGHT_IAM_ARN,
+                    email=member_email, session_name=session_name, user_role=QUICKSIGHT_USER_ROLE,
+                    namespace=QUICKSIGHT_NAMESPACE
+                )
+
+                quicksight_user_details = None
+                if reg_success:
+                    reg_success_count += 1
+                    quicksight_user_details = reg_result # Contains {'Arn': ..., 'UserName': ...}
+                elif reg_result == "User already exists":
+                    reg_exists_count += 1
+                    # User exists, need to get their details (specifically UserName) to add to group
+                    # Construct the potential UserName. For IAM users, it's often complex.
+                    # Let's try deriving it or describing by a known ARN pattern if possible.
+                    # The safest way is often to get it from the registration response if successful,
+                    # or by describing the user. Since we are using IAM ARN + SessionName,
+                    # the UserName might be related.
+                    # *** Simplification Attempt: Construct ARN and use that for describe_user ***
+                    # NOTE: This ARN construction might need adjustment based on exact QS behavior.
+                    # If QUICKSIGHT_IAM_ARN is a ROLE ARN, SessionName is needed. If USER ARN, it might not be.
+                    # Let's assume role + session name for this example:
+                    constructed_user_name_for_describe = f"{QUICKSIGHT_IAM_ARN}/{session_name}"
+                    # NOTE: ^^^ This is a guess. You might need to adjust based on how QuickSight names IAM users.
+                    # It's more reliable if register_user *always* returns the UserName, even if exists,
+                    # but the API doesn't seem to do that.
+                    # Describe user call:
+                    quicksight_user_details = get_quicksight_user_details(AWS_ACCOUNT_ID, AWS_REGION, constructed_user_name_for_describe, QUICKSIGHT_NAMESPACE)
+                    if not quicksight_user_details:
+                         logger.error(f"Failed to get details for existing user: Email='{member_email}', Tried UserName='{constructed_user_name_for_describe}'. Cannot add to group.")
+                         # Count as a group add failure because we couldn't proceed
+                         group_add_failed_count += 1
+
+
+                else: # Registration failed for other reasons
+                    reg_failed_count += 1
+                    logger.error(f"Skipping group add for user '{member_email}' due to registration failure: {reg_result}")
+                    continue # Skip to next member
+
+                # 6. Add user to QuickSight group if UserName was obtained
+                if quicksight_user_details and 'UserName' in quicksight_user_details:
+                    qs_user_name = quicksight_user_details['UserName']
+                    add_success, add_message = add_user_to_quicksight_group(
+                        aws_account_id=AWS_ACCOUNT_ID, region=AWS_REGION,
+                        group_name=QUICKSIGHT_TARGET_GROUP_NAME,
+                        user_name=qs_user_name, # Use the obtained UserName
+                        namespace=QUICKSIGHT_NAMESPACE
+                    )
+                    if add_success:
+                        group_add_success_count += 1
+                    elif add_message == "User already in group":
+                        group_add_exists_count += 1
+                    else:
+                        group_add_failed_count += 1
+                elif reg_success or reg_result == "User already exists":
+                    # Only log error if we expected to find details but didn't
+                    logger.error(f"Could not obtain QuickSight UserName for user '{member_email}' (associated with {session_name}). Cannot add to group.")
+                    if quicksight_user_details is None and reg_result == "User already exists":
+                        # This path specifically tracks failures to describe existing users
+                        pass # Already counted in group_add_failed_count above
+                    elif reg_success:
+                        # This path means registration succeeded but didn't return expected details (API issue?)
+                        group_add_failed_count += 1
+
+
+            else: # User skipped (not user type, no email, no session name)
+                if not member_email: logger.warning(f"Skipping member {member.get('id')} ('{member_display_name}') due to missing email.")
+                elif not session_name: logger.warning(f"Skipping member {member.get('id')} ('{member_display_name}') due to missing SessionName.")
+                else: logger.info(f"Skipping non-user member {member.get('id')} ('{member_display_name}', Type='{odata_type}')")
+                skipped_count += 1
+
+        logger.info("--- Processing Complete ---")
+        final_status_code = 200
+
+    except Exception as e:
+        logger.critical(f"Lambda execution failed critically: {e}", exc_info=True)
+        final_status_code = 500
+        return { # Return error immediately on critical failure
+            'statusCode': final_status_code,
+            'body': json.dumps({'message': f"Critical error: {str(e)}"})
+        }
+
+    # --- Return Final Summary ---
+    summary = {
+        'message': "Execution completed.",
+        'totalMembersProcessed': total_processed,
+        'registration': {
+            'succeeded': reg_success_count,
+            'alreadyExisted': reg_exists_count,
+            'failed': reg_failed_count,
+        },
+        'groupMembership': {
+            'added': group_add_success_count,
+            'alreadyMember': group_add_exists_count,
+            'failed': group_add_failed_count,
+        },
+        'skipped': skipped_count
+    }
+    logger.info(f"Execution Summary: {json.dumps(summary)}")
+    return {
+        'statusCode': final_status_code,
+        'body': json.dumps(summary)
+    }
