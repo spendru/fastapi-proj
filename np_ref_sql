@@ -1,0 +1,23 @@
+-- Define the start/end boundaries based on ET dates, but expressed in UTC
+WITH et_date_boundaries_in_utc AS (
+  SELECT
+    -- Start of 'yesterday' in ET, converted back to its UTC equivalent timestamp
+    (DATE_TRUNC('day', NOW() AT TIME ZONE 'America/New_York') - INTERVAL '1 day')
+      AT TIME ZONE 'America/New_York' AS start_range_utc,
+
+    -- Start of the day *after* 'tomorrow' in ET, converted back to its UTC equivalent timestamp
+    -- This serves as the exclusive upper bound for the range (covers all of 'tomorrow' ET)
+    (DATE_TRUNC('day', NOW() AT TIME ZONE 'America/New_York') + INTERVAL '2 days')
+      AT TIME ZONE 'America/New_York' AS end_range_utc
+)
+SELECT
+  t.* -- Select all columns from your table, or specify columns as needed
+  -- Optional: Display the timestamp in ET for verification
+  , t.utc_timestamp_column AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' AS timestamp_in_et
+FROM
+  your_table_name t,  -- <<< Replace with your actual table name
+  et_date_boundaries_in_utc b
+WHERE
+  -- Compare the stored UTC timestamp against the calculated UTC boundaries
+  t.utc_timestamp_column >= b.start_range_utc
+  AND t.utc_timestamp_column < b.end_range_utc; -- Use '<' for the exclusive end boundary
