@@ -150,3 +150,185 @@ stages:
           globExpressions: '*.apk' # Upload only the .apk file(s) found
           targetFolder: 'builds/apk/$(Build.BuildNumber)' # Optional: Organize in S3 by build number
           # Overwrite: true # Optional
+
+- stage: DeployToIntune
+  displayName: 'Deploy APK to Intune (Managed Google Play)'
+  dependsOn: BuildAPK
+  condition: succeeded()
+  jobs:
+  - job: DeployJob
+    displayName: 'Upload LOB App to Intune'
+    pool:
+      vmImage: 'windows-latest' # Use Windows agent for PowerShell/Graph SDK
+    steps:
+      # Step 1: Download the build artifact (containing the APK)
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download APK Artifact'
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: $(artifactName) # Should match artifactName from BuildAPK stage (e.g., 'flutter_apk')
+          downloadPath: '$(System.ArtifactsDirectory)'
+
+      # Step 2: PowerShell script to handle Intune Upload
+      - task: PowerShell@2
+        displayName: 'Upload APK to Intune as LOB App'
+        inputs:
+          targetType: 'inline'
+          script: |
+            # Define Script Parameters (passed via env variables)
+            $apkDirectory = "$(System.ArtifactsDirectory)/$(artifactName)" # Path to the downloaded artifact folder
+            $apkFileName = "$(apkFileName)" # Get the specific APK name from variables
+            $apkFullPath = Join-Path $apkDirectory $apkFileName
+
+            $tenantId = $env:INTUNE_TENANT_ID
+            $clientId = $env:INTUNE_APP_CLIENT_ID
+            $clientSecret = $env:INTUNE_APP_CLIENT_SECRET
+
+            $appName = $env:APP_NAME # Define App Name - e.g., "$(YourAppName) - $(Build.BuildNumber)"
+            $appDescription = $env:APP_DESCRIPTION # e.g., "Internal build $(Build.BuildNumber)"
+            $publisher = $env:APP_PUBLISHER # e.g., "Your Company"
+            $minimumOsVersion = $env:MIN_OS_VERSION # e.g., "8.0"
+            $targetGroupIdsString = $env:ASSIGN_GROUP_IDS # Optional: Comma-separated AAD Group Object IDs
+
+            Write-Host "Starting Intune LOB App upload process for: $apkFullPath"
+            Write-Host "Target App Name: $appName"
+
+            # Check if APK file exists
+            if (-not (Test-Path $apkFullPath)) {
+                Write-Error "APK file not found at path: $apkFullPath"
+                exit 1
+            }
+
+            # --- Core Logic ---
+
+            # 1. Install Microsoft Graph SDK Module (focus on Apps) if not present
+            Write-Host "Ensuring Microsoft.Graph.DeviceManagement.Apps module is installed..."
+            Install-Module Microsoft.Graph.DeviceManagement.Apps -Scope CurrentUser -Force -ErrorAction SilentlyContinue
+            Import-Module Microsoft.Graph.DeviceManagement.Apps -ErrorAction Stop
+
+            # 2. Connect to Microsoft Graph using App Credentials
+            try {
+                Write-Host "Connecting to Microsoft Graph..."
+                Connect-MgGraph -TenantId $tenantId -AppId $clientId -ClientSecret (ConvertTo-SecureString $clientSecret -AsPlainText -Force)
+                Write-Host "Successfully connected to Microsoft Graph."
+            } catch {
+                Write-Error "Failed to connect to Microsoft Graph: $($_.Exception.Message)"
+                exit 1
+            }
+
+            # 3. Check if App Already Exists (Update vs Create)
+            Write-Host "Checking for existing app named '$appName'..."
+            $existingApp = Get-MgDeviceAppManagementMobileApp -Filter "isof('microsoft.graph.androidLobApp') and displayName eq '$appName'" -ErrorAction SilentlyContinue
+
+            $appId = $null
+            if ($existingApp) {
+                Write-Host "Existing app found (ID: $($existingApp.Id)). Preparing for update."
+                $appId = $existingApp.Id
+                # Note: Updating requires creating a new content version for the existing app ID
+            } else {
+                Write-Host "No existing app found. Preparing to create a new app."
+                # Create the basic app object first
+                $appParams = @{
+                    "@odata.type" = "#microsoft.graph.androidLobApp";
+                    displayName = $appName;
+                    description = $appDescription;
+                    publisher = $publisher;
+                    # Define minimum OS - requires mapping $minimumOsVersion string to the correct boolean property
+                    # Example for 8.0: Requires careful mapping logic based on input string
+                    minimumSupportedOperatingSystem = @{ v8_0 = $true };
+                    # Set isFeatured, privacyInformationUrl, developer, owner etc. if needed
+                }
+                try {
+                    $newApp = New-MgDeviceAppManagementMobileApp -BodyParameter $appParams -ErrorAction Stop
+                    $appId = $newApp.Id
+                    Write-Host "Successfully created new app object with ID: $appId"
+                } catch {
+                    Write-Error "Failed to create new app object: $($_.Exception.Message)"
+                    exit 1
+                }
+            }
+
+            # 4. Upload the APK file content
+            Write-Host "Starting APK upload process for App ID: $appId ..."
+            $fileInfo = Get-Item -Path $apkFullPath
+            $lobAppContentParams = @{
+                "@odata.type" = "#microsoft.graph.mobileAppContent";
+                files = @(
+                    @{
+                        "@odata.type" = "#microsoft.graph.mobileAppContentFile";
+                        name = $fileInfo.Name;
+                        # Upload the file using the SDK's built-in mechanism
+                        # Requires specifying the full path to the source file
+                    }
+                )
+            }
+
+            try {
+                # This command handles creating the content version and uploading the file
+                $contentVersion = New-MgDeviceAppManagementMobileAppContentVersion -MobileAppId $appId -BodyParameter $lobAppContentParams -MobileAppContentFile $apkFullPath -ErrorAction Stop
+                Write-Host "Successfully uploaded APK and created content version $($contentVersion.Id)."
+            } catch {
+                 # Check for specific error related to needing to publish app first
+                if ($_.Exception.Message -like '*mobile app must be published*') {
+                     Write-Warning "App needs to be published first. Attempting to publish..."
+                     Publish-MgDeviceAppManagementMobileApp -MobileAppId $appId -BodyParameter @{ "@odata.type" = "#microsoft.graph.androidLobApp" } -ErrorAction SilentlyContinue
+                     # Retry upload after publish attempt
+                     Write-Host "Retrying upload after publish attempt..."
+                      $contentVersion = New-MgDeviceAppManagementMobileAppContentVersion -MobileAppId $appId -BodyParameter $lobAppContentParams -MobileAppContentFile $apkFullPath -ErrorAction Stop
+                      Write-Host "Successfully uploaded APK on retry."
+                } else {
+                     Write-Error "Failed to upload APK content: $($_.Exception.Message)"
+                     exit 1
+                }
+            }
+
+
+            # 5. (Optional) Assign the App to Groups
+            if (-not [string]::IsNullOrWhiteSpace($targetGroupIdsString)) {
+                $groupIds = $targetGroupIdsString -split ',' | ForEach-Object { $_.Trim() }
+                Write-Host "Assigning app to $($groupIds.Count) group(s)..."
+                foreach ($groupId in $groupIds) {
+                    if ([string]::IsNullOrWhiteSpace($groupId)) { continue }
+                    Write-Host "Assigning to Group ID: $groupId"
+                    $assignmentParams = @{
+                        target = @{
+                            "@odata.type" = "#microsoft.graph.groupAssignmentTarget";
+                            groupId = $groupId
+                        };
+                        intent = "required" # Or "available"
+                        # settings = @{ ... } # Add other settings if needed
+                    }
+                    try {
+                         # Check if assignment exists before creating
+                         $existingAssignment = Get-MgDeviceAppManagementMobileAppAssignment -MobileAppId $appId -Filter "target/groupId eq '$groupId'" -ErrorAction SilentlyContinue
+                         if($existingAssignment){
+                            Write-Host "Assignment to group $groupId already exists."
+                         } else {
+                            New-MgDeviceAppManagementMobileAppAssignment -MobileAppId $appId -BodyParameter $assignmentParams -ErrorAction Stop
+                            Write-Host "Successfully assigned app to group $groupId."
+                         }
+                    } catch {
+                        Write-Error "Failed to assign app to group $groupId : $($_.Exception.Message)"
+                        # Decide if this should fail the pipeline (exit 1) or just warn
+                    }
+                }
+            } else {
+                Write-Host "No target group IDs provided for assignment."
+            }
+
+            Write-Host "Intune LOB App deployment process completed successfully."
+
+        env:
+          # Map pipeline variables (including secrets) to environment variables for the script
+          INTUNE_TENANT_ID: $(intuneTenantId)
+          INTUNE_APP_CLIENT_ID: $(intuneAppClientId)
+          INTUNE_APP_CLIENT_SECRET: $(intuneAppClientSecret) # Secret variable
+          APP_NAME: "$(YourAppName) - $(Build.BuildNumber)" # Customize your app name logic
+          APP_DESCRIPTION: "Build $(Build.BuildNumber) uploaded via Azure DevOps"
+          APP_PUBLISHER: "Your Company Name"
+          MIN_OS_VERSION: "8.0" # Example: Set your minimum required Android version
+          ASSIGN_GROUP_IDS: $(intuneTargetGroupIds) # Optional: Your variable containing group IDs
+          # Make artifact/file info available too
+          artifactName: $(artifactName)
+          apkFileName: $(apkFileName)
