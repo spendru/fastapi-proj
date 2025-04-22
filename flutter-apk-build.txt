@@ -1,0 +1,152 @@
+# azure-pipelines.yml
+
+trigger:
+  branches:
+    include:
+      - main # Or your primary branch
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # --- Configuration ---
+  flutterDockerImage: 'cirrusci/flutter:3.24.0' # Use the same recent stable tag
+  awsServiceConnection: 'MyAWSConnection'
+  awsRegion: 'us-east-1'
+  s3BucketName: 'your-s3-bucket-name'
+  # **NEW/UPDATED for APK**
+  secureFileName: 'release.keystore.jks' # Name of your Keystore Secure File
+  apkOutputDirectory: '$(Build.SourcesDirectory)/build/app/outputs/flutter-apk'
+  apkFileName: 'app-release.apk' # Expected output file name
+  artifactName: 'flutter_apk' # Name for the pipeline artifact
+
+  # **SECRET VARIABLES** (Define these in the Pipeline Variables UI, marked as secret)
+  # keystorePassword: 'YOUR_KEYSTORE_PASSWORD'
+  # keyAlias: 'YOUR_KEY_ALIAS'
+  # keyPassword: 'YOUR_KEY_PASSWORD'
+
+stages:
+- stage: BuildAPK
+  displayName: 'Build Flutter Android APK'
+  jobs:
+  - job: BuildJob
+    displayName: 'Build APK using Docker Container'
+    container: $[ variables['flutterDockerImage'] ]
+    steps:
+      # Step 1: Checkout code
+      - checkout: self
+        clean: true
+
+      # Step 2: (Optional but recommended) Configure Git safe directories
+      - script: |
+          echo "Adding Flutter SDK and Workspace to Git's safe directories..."
+          git config --global --add safe.directory /sdks/flutter
+          git config --global --add safe.directory "$(Build.SourcesDirectory)"
+        displayName: 'Configure Git Safe Directories'
+
+      # Step 3: Download Keystore Secure File
+      # This task makes the secure file available inside the container
+      - task: DownloadSecureFile@1
+        name: releaseKeystore # Reference name for the task's output variable
+        displayName: 'Download Release Keystore'
+        inputs:
+          secureFile: $(secureFileName) # Use variable for the secure file name
+
+      # Step 4: Create key.properties for Android Signing
+      # Flutter uses this file automatically for release builds
+      - script: |
+          echo "Creating key.properties file..."
+          # Use the path variable from the DownloadSecureFile task
+          echo "storeFile=$(releaseKeystore.secureFilePath)" > android/key.properties
+          echo "storePassword=$(keystorePassword)" >> android/key.properties
+          echo "keyAlias=$(keyAlias)" >> android/key.properties
+          echo "keyPassword=$(keyPassword)" >> android/key.properties
+          echo "Created android/key.properties with signing configuration."
+        displayName: 'Create key.properties for Signing'
+        # Ensure secret variables are mapped as environment variables for the script
+        env:
+          keystorePassword: $(keystorePassword)
+          keyAlias: $(keyAlias)
+          keyPassword: $(keyPassword)
+
+      # Step 5: (Optional) Verify Flutter environment
+      - script: flutter doctor -v
+        displayName: 'Verify Flutter Setup'
+
+      # Step 6: Get Flutter dependencies
+      - script: flutter pub get
+        displayName: 'Get Flutter Dependencies'
+
+      # Step 7: Build the Flutter Release APK
+      # Flutter build apk --release automatically uses android/key.properties
+      - script: flutter build apk --release
+        displayName: 'Build Flutter Release APK'
+
+      # Step 8: Verify APK exists (optional sanity check)
+      - script: ls -l $(apkOutputDirectory)/$(apkFileName)
+        displayName: 'Verify Release APK Output'
+        errorActionPreference: continue # Don't fail pipeline if ls fails, build step would have failed already
+
+      # Step 9: Archive the APK file
+      - task: ArchiveFiles@2
+        displayName: 'Archive Release APK'
+        inputs:
+          rootFolderOrFile: $(apkOutputDirectory) # Directory containing the APK
+          includeRootFolder: false
+          # Use a pattern or specific name - specific is simpler if predictable
+          archiveType: 'zip'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/$(artifactName).zip'
+          replaceExistingArchive: true
+          # Ensure we only grab the release APK
+          verbose: true # Add verbose logging for debugging which files are included
+          # Use filter if needed, but targeting the file directly is often easier if path is known
+          # Currently, this zips the *content* of apkOutputDirectory. Might need adjustment.
+          # Let's refine to archive just the APK file directly:
+          # rootFolderOrFile: '$(apkOutputDirectory)/$(apkFileName)' # Target the specific file
+          # includeRootFolder: false # Not applicable when targeting a single file? Check docs.
+
+      # Step 9 (Alternative - Simpler Archive): Archive *just* the APK file
+      - task: CopyFiles@2
+        displayName: 'Copy APK to Staging Directory'
+        inputs:
+          SourceFolder: $(apkOutputDirectory)
+          Contents: $(apkFileName) # Copy only the specific APK file
+          TargetFolder: '$(Build.ArtifactStagingDirectory)/$(artifactName)' # Stage it in a folder
+
+      # Step 10: Publish the APK artifact (the folder containing the APK)
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish APK Artifact'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(artifactName)' # Path to the staged folder
+          ArtifactName: $(artifactName) # Name the artifact
+          publishLocation: 'Container'
+
+- stage: DeployAPK
+  displayName: 'Deploy APK to AWS S3'
+  dependsOn: BuildAPK
+  condition: succeeded()
+  jobs:
+  - job: DeployJob
+    displayName: 'Upload APK to S3'
+    steps:
+      # Step 1: Download the build artifact
+      - task: DownloadBuildArtifacts@1
+        displayName: 'Download APK Artifact'
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: $(artifactName) # Matches published artifact name
+          downloadPath: '$(System.ArtifactsDirectory)'
+
+      # Step 2: Upload the APK file to AWS S3
+      - task: AWSS3Upload@1
+        displayName: 'Upload APK to AWS S3'
+        inputs:
+          awsCredentials: $(awsServiceConnection)
+          regionName: $(awsRegion)
+          bucketName: $(s3BucketName)
+          # Source is the folder containing the downloaded artifact, then the subfolder we created, then the file pattern
+          sourceFolder: '$(System.ArtifactsDirectory)/$(artifactName)'
+          globExpressions: '*.apk' # Upload only the .apk file(s) found
+          targetFolder: 'builds/apk/$(Build.BuildNumber)' # Optional: Organize in S3 by build number
+          # Overwrite: true # Optional
