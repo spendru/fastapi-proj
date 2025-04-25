@@ -1,0 +1,126 @@
+import pandas as pd
+from sqlalchemy import create_engine, text
+import time
+import io # Required for potential copy_expert optimization
+
+# --- Configuration ---
+DB_CONNECTION_STRING = "postgresql+psycopg2://your_user:your_password@your_host:your_port/your_database"
+TARGET_TABLE_NAME = "your_target_table"  # The table you want to update
+STAGING_TABLE_NAME = "staging_for_update" # Temporary table name
+KEY_COLUMNS = ['id']                    # List of column(s) forming the unique key
+COLUMNS_TO_UPDATE = ['column_a', 'column_b', 'last_updated'] # Columns to update in target table
+SCHEMA_NAME = None                      # Optional: Specify if your table is in a specific schema (e.g., 'public')
+
+# --- Sample DataFrame Generation (Replace with your actual DataFrame) ---
+print("Generating sample DataFrame...")
+num_rows = 100000
+data = {
+    'id': range(1, num_rows + 1), # Example primary key
+    'column_a': [f"value_a_{i}" for i in range(num_rows)],
+    'column_b': [i * 10 for i in range(num_rows)],
+    'last_updated': pd.Timestamp.now() # Add an update timestamp
+    # Add other columns present in your actual DataFrame
+}
+df = pd.DataFrame(data)
+# Ensure key columns and update columns exist in the DataFrame
+update_df = df[KEY_COLUMNS + COLUMNS_TO_UPDATE].copy()
+print(f"Sample DataFrame generated with {len(update_df)} rows.")
+# --- End Sample DataFrame ---
+
+
+# --- Database Interaction ---
+print("Connecting to database...")
+engine = create_engine(DB_CONNECTION_STRING, echo=False) # Set echo=True for debugging SQL
+
+start_time = time.time()
+
+try:
+    # Use a single transaction for the whole process
+    with engine.connect() as connection:
+        with connection.begin(): # Start transaction
+            print(f"Uploading {len(update_df)} rows to staging table '{STAGING_TABLE_NAME}'...")
+
+            # 1. Upload DataFrame to Staging Table
+            #    - if_exists='replace': Drops and recreates the staging table each time.
+            #    - index=False: Don't write the DataFrame index as a column.
+            #    - method='multi': Uses multi-value INSERTs, often faster. Chunksize controls rows per INSERT.
+            #    - chunksize: Adjust based on memory and network performance (e.g., 10000).
+            #    - For even faster uploads (using COPY), see the 'copy_expert' method below.
+            update_df.to_sql(
+                name=STAGING_TABLE_NAME,
+                con=connection,
+                schema=SCHEMA_NAME,
+                if_exists='replace', # Use 'append' if staging table exists and you want to add data
+                index=False,
+                chunksize=10000, # Adjust as needed
+                method='multi'   # Generally good performance
+            )
+            upload_time = time.time()
+            print(f"Staging table created and populated in {upload_time - start_time:.2f} seconds.")
+
+
+            # Optional: Add index to staging table key columns for faster joins
+            print("Creating index on staging table...")
+            staging_table_full_name = f'"{SCHEMA_NAME}"."{STAGING_TABLE_NAME}"' if SCHEMA_NAME else f'"{STAGING_TABLE_NAME}"'
+            target_table_full_name = f'"{SCHEMA_NAME}"."{TARGET_TABLE_NAME}"' if SCHEMA_NAME else f'"{TARGET_TABLE_NAME}"'
+
+            # Create index on the key column(s) in the staging table
+            key_cols_sql_staging = ", ".join([f'"{col}"' for col in KEY_COLUMNS])
+            index_name = f"idx_{STAGING_TABLE_NAME}_keys"
+            index_sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {staging_table_full_name} ({key_cols_sql_staging});"
+            connection.execute(text(index_sql))
+            index_time = time.time()
+            print(f"Index created in {index_time - upload_time:.2f} seconds.")
+
+
+            # 2. Construct and Execute the UPDATE FROM statement
+            print("Constructing UPDATE statement...")
+            set_clauses = ", ".join([f'"{col}" = s."{col}"' for col in COLUMNS_TO_UPDATE])
+            where_clauses = " AND ".join([f't."{col}" = s."{col}"' for col in KEY_COLUMNS])
+
+            sql_update_statement = f"""
+            UPDATE {target_table_full_name} AS t
+            SET {set_clauses}
+            FROM {staging_table_full_name} AS s
+            WHERE {where_clauses};
+            """
+
+            print("Executing UPDATE FROM statement...")
+            # print(f"SQL: {sql_update_statement}") # Uncomment to see the exact SQL
+            result = connection.execute(text(sql_update_statement))
+            update_exec_time = time.time()
+            print(f"UPDATE executed in {update_exec_time - index_time:.2f} seconds.")
+            print(f"Number of rows affected (potentially): {result.rowcount}") # Note: rowcount might be -1 depending on driver/DB settings
+
+            # 3. Drop the Staging Table (optional if using TEMP tables, but good practice otherwise)
+            # print(f"Dropping staging table '{STAGING_TABLE_NAME}'...")
+            # connection.execute(text(f"DROP TABLE IF EXISTS {staging_table_full_name};"))
+            # drop_time = time.time()
+            # print(f"Staging table dropped in {drop_time - update_exec_time:.2f} seconds.")
+
+            # Transaction commits automatically here if no exceptions occurred
+
+    total_time = time.time() - start_time
+    print(f"--- Update process completed successfully in {total_time:.2f} seconds ---")
+
+except Exception as e:
+    print(f"--- ERROR during update process: {e} ---")
+    # Transaction automatically rolls back on exception when using 'with connection.begin()'
+
+finally:
+    # Optional: Explicitly drop the staging table outside the transaction
+    # in case of errors *before* the drop statement within the transaction.
+    # This requires a new connection/transaction.
+    try:
+        with engine.connect() as connection:
+             with connection.begin():
+                staging_table_full_name = f'"{SCHEMA_NAME}"."{STAGING_TABLE_NAME}"' if SCHEMA_NAME else f'"{STAGING_TABLE_NAME}"'
+                print(f"(Cleanup) Dropping staging table '{STAGING_TABLE_NAME}'...")
+                connection.execute(text(f"DROP TABLE IF EXISTS {staging_table_full_name};"))
+                print("(Cleanup) Staging table dropped.")
+    except Exception as cleanup_e:
+        print(f"--- ERROR during staging table cleanup: {cleanup_e} ---")
+
+    # Dispose the engine if the script is ending or connection is no longer needed
+    engine.dispose()
+    print("Database engine disposed.")
