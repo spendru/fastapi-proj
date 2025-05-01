@@ -1,0 +1,77 @@
+import pandas as pd
+from sqlalchemy import create_engine, MetaData, Table, delete, text, inspect
+import time
+import math
+
+# --- Configuration ---
+DATABASE_URL = "postgresql+psycopg2://user:password@host:port/database" # Example for PostgreSQL
+TABLE_NAME = 'your_table_name'
+ID_COLUMN_NAME = 'id' # The name of the primary key column in your table
+DATAFRAME_ID_COLUMN = 'id' # The name of the column in your DataFrame holding the IDs
+BATCH_SIZE = 1000  # Adjust based on DB limits and performance testing (500-5000 is common)
+
+# --- Example DataFrame ---
+# Replace this with your actual DataFrame loading
+ids_to_delete = list(range(1, 200001)) # Example: 200k IDs
+df = pd.DataFrame({DATAFRAME_ID_COLUMN: ids_to_delete})
+
+# --- SQLAlchemy Setup ---
+engine = create_engine(DATABASE_URL)
+metadata = MetaData()
+
+# Reflect the table structure (or define it explicitly)
+# Option 1: Reflection (simpler if table exists)
+inspector = inspect(engine)
+if not inspector.has_table(TABLE_NAME):
+    raise ValueError(f"Table '{TABLE_NAME}' not found in the database.")
+# Reflect the specific table
+your_table = Table(TABLE_NAME, metadata, autoload_with=engine)
+
+# Option 2: Explicit Definition (if you prefer or reflection fails)
+# from sqlalchemy import Column, Integer, String # etc.
+# your_table = Table(
+#     TABLE_NAME,
+#     metadata,
+#     Column(ID_COLUMN_NAME, Integer, primary_key=True), # Adjust type as needed
+#     # ... other columns if needed for definition, but not necessary for delete
+# )
+
+# --- Deletion Logic ---
+ids_list = df[DATAFRAME_ID_COLUMN].unique().tolist()
+total_ids = len(ids_list)
+num_batches = math.ceil(total_ids / BATCH_SIZE)
+
+print(f"Total IDs to delete: {total_ids}")
+print(f"Batch size: {BATCH_SIZE}")
+print(f"Number of batches: {num_batches}")
+
+start_time = time.time()
+deleted_count = 0
+
+# Use a single connection and transaction for efficiency
+with engine.connect() as connection:
+    # Begin a transaction
+    with connection.begin():
+        for i in range(num_batches):
+            batch_start_index = i * BATCH_SIZE
+            batch_end_index = (i + 1) * BATCH_SIZE
+            id_batch = ids_list[batch_start_index:batch_end_index]
+
+            if not id_batch:
+                continue
+
+            print(f"Processing batch {i+1}/{num_batches} (IDs {batch_start_index+1} to {min(batch_end_index, total_ids)})")
+
+            # Construct the DELETE statement using SQLAlchemy Core API
+            stmt = delete(your_table).where(your_table.c[ID_COLUMN_NAME].in_(id_batch))
+
+            # Execute the statement
+            result = connection.execute(stmt)
+            deleted_count += result.rowcount # Get the number of rows deleted in this batch
+
+        # Transaction is automatically committed here if no exceptions occurred
+        # Or rolled back if an exception happened
+
+print(f"--- Deletion Complete ---")
+print(f"Total time taken: {time.time() - start_time:.2f} seconds")
+print(f"Reported rows deleted by database: {deleted_count}") # Note: rowcount support varies by DB/driver
