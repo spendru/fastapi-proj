@@ -1,0 +1,62 @@
+from sqlalchemy import create_engine, text
+import time
+import math
+
+# --- Configuration ---
+DATABASE_URL = "postgresql+psycopg2://user:password@host:port/database" # Replace with your DB connection string
+TABLE_NAME = 'cp-table'
+# IMPORTANT: Ensure this column name is correct and properly quoted if needed for your DB
+# Using double quotes is standard SQL for case-sensitive/special character identifiers.
+# Adjust quoting "" or remove if not needed for your specific DB/column name.
+ID_COLUMN_NAME = '"record_id"'
+BATCH_SIZE = 1000
+
+# --- Example IDs (e.g., from a DataFrame) ---
+# Assume ids_list is your list of IDs to delete
+ids_list = list(range(1, 200001)) # Example: 200k IDs
+total_ids = len(ids_list)
+num_batches = math.ceil(total_ids / BATCH_SIZE)
+
+print(f"Target Table: {TABLE_NAME}")
+print(f"ID Column: {ID_COLUMN_NAME}")
+print(f"Total IDs to delete: {total_ids}")
+print(f"Batch size: {BATCH_SIZE}")
+print(f"Number of batches: {num_batches}")
+
+# --- SQLAlchemy Engine ---
+engine = create_engine(DATABASE_URL)
+
+start_time = time.time()
+deleted_count = 0
+
+# Use a single connection and transaction
+with engine.connect() as connection:
+    # Begin a transaction
+    with connection.begin():
+        for i in range(num_batches):
+            batch_start_index = i * BATCH_SIZE
+            batch_end_index = (i + 1) * BATCH_SIZE
+            id_batch = ids_list[batch_start_index:batch_end_index]
+
+            if not id_batch:
+                continue
+
+            print(f"Processing batch {i+1}/{num_batches}")
+
+            # --- Construct the DELETE statement using text() ---
+            # Use a named bind parameter (e.g., :id_list) for the IN clause.
+            # SQLAlchemy/DBAPI driver handles expanding the list into the appropriate
+            # syntax (e.g., (?,?,?) or (%s,%s,%s)) safely.
+            # Manually include quoting for table/column names if required by your DB.
+            sql_query = text(f'DELETE FROM "{TABLE_NAME}" WHERE {ID_COLUMN_NAME} IN :id_list')
+
+            # Execute the statement, passing the actual list/tuple as the value
+            # for the named parameter ':id_list' in a dictionary.
+            result = connection.execute(sql_query, {"id_list": tuple(id_batch)}) # Use tuple for potential minor perf gain/immutability
+            deleted_count += result.rowcount # rowcount support depends on DB/driver
+
+        # Transaction commits here if successful, rolls back on error.
+
+print(f"--- Deletion Complete ---")
+print(f"Total time taken: {time.time() - start_time:.2f} seconds")
+print(f"Reported rows deleted by database: {deleted_count}")
