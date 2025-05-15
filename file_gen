@@ -1,0 +1,85 @@
+import json
+import os
+
+def create_json_files_from_list(filename_list_path, json_content):
+    """
+    Reads a list of filenames from a text file and creates a .json file
+    for each, populated with the provided JSON content.
+
+    Args:
+        filename_list_path (str): The path to the text file containing
+                                  filenames (one per line).
+        json_content (dict): The Python dictionary to write as JSON content
+                             into each new file.
+    """
+    try:
+        with open(filename_list_path, 'r') as f_list:
+            base_filenames = [line.strip() for line in f_list if line.strip()] # Read and strip whitespace/empty lines
+    except FileNotFoundError:
+        print(f"Error: The file '{filename_list_path}' was not found.")
+        return
+    except Exception as e:
+        print(f"An error occurred while reading '{filename_list_path}': {e}")
+        return
+
+    if not base_filenames:
+        print(f"No filenames found in '{filename_list_path}'.")
+        return
+
+    created_files_count = 0
+    for base_filename in base_filenames:
+        # Construct the new JSON filename
+        # Handles if the base_filename already has an extension or not
+        name_part, _ = os.path.splitext(base_filename)
+        json_filename = f"{name_part}.json"
+
+        try:
+            with open(json_filename, 'w') as f_json:
+                json.dump(json_content, f_json, indent=4) # indent for pretty printing
+            print(f"Successfully created '{json_filename}'")
+            created_files_count += 1
+        except IOError:
+            print(f"Error: Could not write to file '{json_filename}'. Check permissions or path.")
+        except Exception as e:
+            print(f"An unexpected error occurred while creating '{json_filename}': {e}")
+
+    print(f"\nProcess complete. {created_files_count} JSON file(s) created.")
+
+# --- How to use the function ---
+
+# 1. Define the path to your file that contains the list of filenames.
+#    For example, if you have a file named 'my_filenames.txt' in the
+#    same directory as your script:
+input_file_with_names = "my_filenames.txt"
+
+#    If 'my_filenames.txt' looks like this:
+#    file1
+#    another_document
+#    report_data
+
+# 2. Define the JSON content you want in each file.
+#    The problem specifies: { "qry_prms": "-24"}
+defined_json_data = {"qry_prms": "-24"}
+
+# 3. Call the function
+#    Make sure you have 'my_filenames.txt' (or your specified file)
+#    in the correct location with the base filenames listed inside.
+#    For example, create a 'my_filenames.txt' with content:
+#    alpha
+#    beta
+#    gamma
+
+# Create the example input file for demonstration if it doesn't exist
+if not os.path.exists(input_file_with_names):
+    with open(input_file_with_names, 'w') as f:
+        f.write("alpha\n")
+        f.write("beta.txt\n") # Example with an existing extension
+        f.write("gamma\n")
+    print(f"Created a sample input file: '{input_file_with_names}' for demonstration.")
+
+create_json_files_from_list(input_file_with_names, defined_json_data)
+
+# This will generate:
+# alpha.json with content { "qry_prms": "-24"}
+# beta.json with content { "qry_prms": "-24"} (note: .txt was replaced by .json)
+# gamma.json with content { "qry_prms": "-24"}
