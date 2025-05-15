@@ -1,0 +1,86 @@
+import json
+import os
+
+def create_json_files_from_list(filename_list_path, json_content, output_folder="output"):
+    """
+    Reads a list of filenames from a text file and creates a .json file
+    for each in a specified output folder, populated with the provided JSON content.
+    Creates the output folder if it doesn't exist.
+
+    Args:
+        filename_list_path (str): The path to the text file containing
+                                  filenames (one per line).
+        json_content (dict): The Python dictionary to write as JSON content
+                             into each new file.
+        output_folder (str): The name of the folder where JSON files will be created.
+                             Defaults to "output".
+    """
+    try:
+        with open(filename_list_path, 'r') as f_list:
+            base_filenames = [line.strip() for line in f_list if line.strip()]
+    except FileNotFoundError:
+        print(f"Error: The file '{filename_list_path}' was not found.")
+        return
+    except Exception as e:
+        print(f"An error occurred while reading '{filename_list_path}': {e}")
+        return
+
+    if not base_filenames:
+        print(f"No filenames found in '{filename_list_path}'.")
+        return
+
+    # Create the output directory if it doesn't exist
+    try:
+        os.makedirs(output_folder, exist_ok=True) # exist_ok=True prevents error if dir already exists
+        print(f"Ensured output directory '{output_folder}' exists.")
+    except OSError as e:
+        print(f"Error: Could not create directory '{output_folder}': {e}")
+        return
+
+    created_files_count = 0
+    for base_filename in base_filenames:
+        name_part, _ = os.path.splitext(base_filename)
+        # Construct the full path for the new JSON file inside the output folder
+        json_filename_only = f"{name_part}.json"
+        full_json_path = os.path.join(output_folder, json_filename_only)
+
+        try:
+            with open(full_json_path, 'w') as f_json:
+                json.dump(json_content, f_json, indent=4)
+            print(f"Successfully created '{full_json_path}'")
+            created_files_count += 1
+        except IOError:
+            print(f"Error: Could not write to file '{full_json_path}'. Check permissions or path.")
+        except Exception as e:
+            print(f"An unexpected error occurred while creating '{full_json_path}': {e}")
+
+    print(f"\nProcess complete. {created_files_count} JSON file(s) created in '{output_folder}'.")
+
+# --- How to use the function ---
+
+# 1. Define the path to your file that contains the list of filenames.
+input_file_with_names = "my_filenames.txt"
+
+# 2. Define the JSON content you want in each file.
+defined_json_data = {"qry_prms": "-24"}
+
+# 3. Define the output folder name (optional, defaults to "output")
+output_directory_name = "output" # You can change this if needed
+
+# Create the example input file for demonstration if it doesn't exist
+if not os.path.exists(input_file_with_names):
+    with open(input_file_with_names, 'w') as f:
+        f.write("alpha\n")
+        f.write("beta.txt\n")
+        f.write("gamma\n")
+    print(f"Created a sample input file: '{input_file_with_names}' for demonstration.")
+
+# Call the function, specifying the output folder
+create_json_files_from_list(input_file_with_names, defined_json_data, output_directory_name)
+
+# This will:
+# 1. Create a folder named "output" (if it doesn't exist) in the same directory as the script.
+# 2. Inside "output", it will generate:
+#    alpha.json with content { "qry_prms": "-24"}
+#    beta.json with content { "qry_prms": "-24"}
+#    gamma.json with content { "qry_prms": "-24"}
