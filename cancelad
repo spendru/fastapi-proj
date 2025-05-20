@@ -1,0 +1,102 @@
+<#
+.SYNOPSIS
+    Invalidates all active Azure AD sessions (refresh tokens and session cookies) for users listed in a specified file.
+
+.DESCRIPTION
+    This script reads User Principal Names (UPNs) from a text file, one UPN per line.
+    For each user, it attempts to revoke their Azure AD refresh tokens and sign-in sessions.
+    Administrator privileges (e.g., User Administrator, Authentication Administrator, or Global Administrator) are required.
+    The AzureAD module or Microsoft.Graph PowerShell SDK is required. This script uses the Microsoft.Graph SDK.
+
+.PARAMETER FilePath
+    The path to the text file containing the User Principal Names (UPNs) of the users whose sessions should be invalidated.
+    Each UPN should be on a new line.
+
+.EXAMPLE
+    .\Invalidate-UserSessions.ps1 -FilePath "C:\temp\users_to_invalidate.txt"
+
+    This command will read UPNs from "C:\temp\users_to_invalidate.txt" and attempt to invalidate their sessions.
+
+.NOTES
+    Author: Azure AD Professional (AI Assistant)
+    Version: 1.0
+    Date: 2025-05-20
+
+    IMPORTANT:
+    - Ensure you have the Microsoft.Graph PowerShell SDK installed: Install-Module Microsoft.Graph -Scope CurrentUser
+    - Connect to Microsoft Graph with the required permissions before running:
+      Connect-MgGraph -Scopes "User.ReadWrite.All", "Directory.AccessAsUser.All"
+    - This action is disruptive to users as it will sign them out of all Microsoft 365 sessions.
+    - Test thoroughly in a non-production environment first.
+#>
+
+param (
+    [Parameter(Mandatory = $true)]
+    [string]$FilePath
+)
+
+# Check if the Microsoft.Graph module is available
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
+    Write-Error "The Microsoft.Graph PowerShell SDK is not installed. Please install it using: Install-Module Microsoft.Graph -Scope CurrentUser"
+    exit 1
+}
+
+# Check if connected to Microsoft Graph
+try {
+    Get-MgContext -ErrorAction Stop | Out-Null
+}
+catch {
+    Write-Error "Not connected to Microsoft Graph. Please connect using: Connect-MgGraph -Scopes 'User.ReadWrite.All', 'Directory.AccessAsUser.All'"
+    exit 1
+}
+
+# Check if the input file exists
+if (-not (Test-Path $FilePath)) {
+    Write-Error "File not found: $FilePath"
+    exit 1
+}
+
+# Read UPNs from the file
+$userPrincipalNames = Get-Content $FilePath
+
+if ($userPrincipalNames.Count -eq 0) {
+    Write-Warning "The specified file is empty or does not contain any User Principal Names."
+    exit 0
+}
+
+Write-Host "Starting session invalidation process for $($userPrincipalNames.Count) user(s)..." -ForegroundColor Yellow
+
+foreach ($upn in $userPrincipalNames) {
+    $trimmedUpn = $upn.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmedUpn)) {
+        Write-Warning "Skipping empty line in the input file."
+        continue
+    }
+
+    Write-Host "Attempting to invalidate sessions for user: $trimmedUpn"
+
+    try {
+        # Get the user object to ensure it exists
+        $user = Get-MgUser -UserId $trimmedUpn -ErrorAction Stop
+        if ($user) {
+            # Invalidate all refresh tokens (sign-out from all sessions)
+            # This command invalidates all refresh tokens issued to applications for a user
+            # (including Microsoft 365 apps, custom apps, etc.).
+            # It also revokes session cookies in the browser.
+            Revoke-MgUserSignInSession -UserId $user.Id -ErrorAction Stop
+            Write-Host "Successfully invalidated sessions for user: $trimmedUpn (User ID: $($user.Id))" -ForegroundColor Green
+        }
+    }
+    catch [Microsoft.Graph.PowerShell.Models.MicrosoftGraphODataErrorsODataError] {
+        if ($_.ErrorDetails.Message -match "Request_ResourceNotFound") {
+            Write-Error "User not found: $trimmedUpn. $($_.Exception.Message)"
+        } else {
+            Write-Error "Error invalidating sessions for user $trimmedUpn: $($_.Exception.Message)"
+        }
+    }
+    catch {
+        Write-Error "An unexpected error occurred while processing user $trimmedUpn: $($_.Exception.Message)"
+    }
+}
+
+Write-Host "Session invalidation process completed." -ForegroundColor Yellow
