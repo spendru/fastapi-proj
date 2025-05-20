@@ -1,0 +1,39 @@
+Prerequisites & Permissions
+PowerShell: Ensure you have PowerShell 5.1 or later.
+Microsoft Graph PowerShell SDK: This script uses the modern Microsoft.Graph module. If you don't have it, install it:
+PowerShell
+
+Install-Module Microsoft.Graph -Scope CurrentUser -Force
+Permissions: You need appropriate administrative permissions in Azure AD to revoke user sessions. Roles like User Administrator, Authentication Administrator, or Global Administrator typically have these rights.
+Connect to Microsoft Graph: Before running the script, you need to connect to Microsoft Graph with the necessary scopes:
+PowerShell
+
+Connect-MgGraph -Scopes "User.ReadWrite.All", "Directory.AccessAsUser.All"
+You'll be prompted to sign in with your admin credentials.
+How to Use the Script
+Create a User File:
+
+Create a plain text file (e.g., users_to_invalidate.txt).
+Add one User Principal Name (UPN) per line for each user whose sessions you want to invalidate. Example users_to_invalidate.txt:
+user1@yourdomain.com
+user2@yourdomain.com
+another.user@yourdomain.com
+Save the Script:
+
+Copy the PowerShell script above and save it as a .ps1 file (e.g., Invalidate-UserSessions.ps1).
+Run the Script:
+
+Open PowerShell.
+Navigate to the directory where you saved the script.
+Execute the script, providing the path to your user file:
+PowerShell
+
+.\Invalidate-UserSessions.ps1 -FilePath "C:\path\to\your\users_to_invalidate.txt"
+Replace "C:\path\to\your\users_to_invalidate.txt" with the actual path to your file.
+Important Considerations 🚨
+Impact: This action will immediately sign out the specified users from all devices and applications that use Azure AD for authentication. They will need to re-authenticate. This can be disruptive, so plan accordingly.
+Testing: ALWAYS test this script in a non-production/test Azure AD environment first with a limited set of test users.
+Error Handling: The script includes basic error handling (e.g., user not found, not connected to Graph). Review and enhance it if needed for your environment.
+Logging: For auditing purposes, you might want to add more robust logging of actions taken. The script currently outputs to the console.
+Large Number of Users: If you are invalidating sessions for a very large number of users, consider running the script in batches or during off-peak hours to minimize potential performance impact on Azure AD services or your own network.
+Alternative: Revoke-AzureADUserAllRefreshToken (AzureAD Module): If you are still using the older AzureAD module, the equivalent command is Revoke-AzureADUserAllRefreshToken -ObjectId <UserObjectId>. However, Microsoft is deprecating the AzureAD and MSOnline modules, so using the Microsoft.Graph SDK is recommended for future-proofing. The script above uses Revoke-MgUserSignInSession from the Graph SDK, which is the current recommended cmdlet.
