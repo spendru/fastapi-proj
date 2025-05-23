@@ -1,0 +1,47 @@
+from faker import Faker
+import pandas as pd
+import hashlib
+
+# --- Initialize Faker (no global seed here, or it will be overridden) ---
+fake = Faker()
+
+def get_deterministic_fake_name(original_name, name_type="first"):
+    if pd.isna(original_name):
+        return None
+
+    # Create a consistent seed from the original name.
+    # Using hashlib ensures the input to Faker.seed() is an integer and derived from the string.
+    # Add a salt or type distinction if the same string could be a first or last name
+    # and you want them to map to different fake values.
+    seed_string = f"{original_name}_{name_type}" # e.g., "Alice_first"
+    seed_value = int(hashlib.md5(seed_string.encode('utf-8')).hexdigest(), 16)
+
+    Faker.seed(seed_value % (2**32 -1)) # Seed must be an integer. Modulo to keep it in range.
+
+    if name_type == "first":
+        return fake.first_name()
+    elif name_type == "last":
+        return fake.last_name()
+    else:
+        return None # Or raise error
+
+# --- Sample DataFrame ---
+data = {
+    'id': [1, 2, 3, 4],
+    'first_name': ['Alice', 'Bob', 'Alice', 'Charles'],
+    'last_name': ['Smith', 'Wonder', 'Smith', 'Xavier']
+}
+df = pd.DataFrame(data)
+
+print("Original DataFrame:")
+print(df)
+
+# --- Apply Deterministic Faker ---
+df['masked_first_name'] = df['first_name'].apply(lambda x: get_deterministic_fake_name(x, "first"))
+df['masked_last_name'] = df['last_name'].apply(lambda x: get_deterministic_fake_name(x, "last"))
+
+print("\nMasked DataFrame (Deterministic Seed per Value):")
+print(df)
+# Now, every time this script runs:
+# - 'Alice' as a first name will always map to the same fake first name.
+# - 'Smith' as a last name will always map to the same fake last name.
