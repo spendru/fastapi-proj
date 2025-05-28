@@ -1,0 +1,228 @@
+import json
+import os
+import urllib3
+
+# Initialize the Secrets Manager client and HTTP client outside the handler
+# for better performance (Lambda execution environment reuse)
+import boto3
+secrets_manager_client = boto3.client('secretsmanager')
+http = urllib3.PoolManager()
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler function.
+
+    Args:
+        event (dict): The event data passed to the Lambda function.
+        context (object): The Lambda runtime information.
+
+    Returns:
+        dict: The response from the second API call or an error message.
+    """
+    print(f"Received event: {json.dumps(event)}")
+
+    # --- 1. Configuration ---
+    # It's good practice to externalize these as environment variables
+    secret_name = os.environ.get('SECRET_NAME')
+    auth_api_url = os.environ.get('AUTH_API_URL') # URL to get the token
+    target_api_url = os.environ.get('TARGET_API_URL') # URL to call with the token
+
+    if not secret_name or not auth_api_url or not target_api_url:
+        print("Error: Environment variables SECRET_NAME, AUTH_API_URL, or TARGET_API_URL not set.")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'Configuration error: Missing environment variables.'})
+        }
+
+    try:
+        # --- 2. Retrieve Credentials from AWS Secrets Manager ---
+        print(f"Retrieving secret: {secret_name}")
+        get_secret_value_response = secrets_manager_client.get_secret_value(
+            SecretId=secret_name
+        )
+
+        if 'SecretString' in get_secret_value_response:
+            secret = json.loads(get_secret_value_response['SecretString'])
+            username = secret.get('username')
+            password = secret.get('password')
+        else:
+            # Handle binary secret if needed, though typically credentials are JSON strings
+            print("Error: SecretString not found in secret.")
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': 'Could not parse credentials from Secrets Manager.'})
+            }
+
+        if not username or not password:
+            print("Error: 'username' or 'password' not found in the secret.")
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': "Credentials format error in Secrets Manager."})
+            }
+        print("Successfully retrieved credentials.")
+
+        # --- 3. Make REST API call to get the token ---
+        auth_payload = {
+            'username': username,
+            'password': password
+            # Add any other required fields for your auth API
+        }
+        encoded_auth_payload = json.dumps(auth_payload).encode('utf-8')
+        auth_headers = {'Content-Type': 'application/json'}
+
+        print(f"Requesting token from: {auth_api_url}")
+        auth_response = http.request(
+            'POST',
+            auth_api_url,
+            body=encoded_auth_payload,
+            headers=auth_headers
+        )
+
+        if auth_response.status != 200:
+            print(f"Error getting token. Status: {auth_response.status}, Data: {auth_response.data.decode('utf-8')}")
+            return {
+                'statusCode': auth_response.status,
+                'body': json.dumps({
+                    'error': 'Failed to authenticate and get token.',
+                    'details': auth_response.data.decode('utf-8')
+                })
+            }
+
+        auth_response_data = json.loads(auth_response.data.decode('utf-8'))
+        # --- IMPORTANT: Adapt this part based on your auth API's response structure ---
+        # Assuming the token is returned in a field named 'access_token' or 'token'
+        token = auth_response_data.get('access_token') or auth_response_data.get('token')
+
+        if not token:
+            print(f"Error: Token not found in auth response. Response: {auth_response_data}")
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': 'Token not found in authentication response.'})
+            }
+        print("Successfully obtained token.")
+
+        # --- 4. Create input JSON for the target API ---
+        # This will likely come from the 'event' or be constructed based on it
+        # For this example, let's assume the input event is the payload for the target API
+        target_api_payload = event.get("target_payload", {}) # Default to empty if not provided
+        encoded_target_payload = json.dumps(target_api_payload).encode('utf-8')
+
+        # --- 5. Prepare Headers for the Target API Call (including Cookie) ---
+        target_api_headers = {
+            'Content-Type': 'application/json',
+            'Cookie': f'session_token={token}' # Adjust cookie name 'session_token' as needed
+            # Add any other required headers
+        }
+        print(f"Target API headers: {target_api_headers}")
+        print(f"Target API payload: {json.dumps(target_api_payload)}")
+
+
+        # --- 6. Invoke the Target REST API ---
+        print(f"Calling target API: {target_api_url}")
+        target_response = http.request(
+            'POST', # Or GET, PUT, etc., as needed
+            target_api_url,
+            body=encoded_target_payload,
+            headers=target_api_headers
+        )
+
+        print(f"Target API response status: {target_response.status}")
+        print(f"Target API response data: {target_response.data.decode('utf-8')}")
+
+        return {
+            'statusCode': target_response.status,
+            'body': target_response.data.decode('utf-8'),
+            'headers': dict(target_response.headers)
+        }
+
+    except secrets_manager_client.exceptions.ResourceNotFoundException:
+        print(f"Error: Secret '{secret_name}' not found.")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': f"Secret '{secret_name}' not found."})
+        }
+    except Exception as e:
+        print(f"An unexpected error occurred: {str(e)}")
+        # import traceback
+        # print(traceback.format_exc()) # For detailed debugging in CloudWatch
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'An unexpected error occurred.', 'details': str(e)})
+        }
+
+# --- Example Usage (for local testing, not part of Lambda deployment) ---
+if __name__ == '__main__':
+    # --- Mock AWS Environment Variables for local testing ---
+    os.environ['SECRET_NAME'] = "your/secret/name"  # Replace with your actual secret name/ARN
+    os.environ['AUTH_API_URL'] = "https://your-auth-api.com/token" # Replace
+    os.environ['TARGET_API_URL'] = "https://your-target-api.com/data" # Replace
+
+    # --- Mock Event ---
+    mock_event = {
+        "target_payload": {
+            "key1": "value1",
+            "key2": "value2"
+        }
+        # Add any other data your Lambda expects in the event
+    }
+
+    # --- Mock Context (optional, usually not needed for simple tests) ---
+    mock_context = {}
+
+    print("--- Simulating Lambda Execution ---")
+    # Before running locally:
+    # 1. Ensure you have AWS credentials configured that can access Secrets Manager.
+    # 2. Your auth API and target API should be accessible.
+    # 3. You might need to mock the `boto3` and `urllib3` calls if you don't want to make real calls.
+
+    # A simple way to "mock" secrets manager for local testing without hitting AWS:
+    # (More sophisticated mocking would use libraries like 'moto')
+    original_get_secret_value = secrets_manager_client.get_secret_value
+    def mock_get_secret_value(SecretId):
+        print(f"[Mock] Getting secret for {SecretId}")
+        if SecretId == os.environ['SECRET_NAME']:
+            return {
+                'SecretString': json.dumps({
+                    'username': 'testuser',
+                    'password': 'testpassword'
+                })
+            }
+        raise secrets_manager_client.exceptions.ResourceNotFoundException({}, {})
+    secrets_manager_client.get_secret_value = mock_get_secret_value
+
+
+    # A simple way to "mock" http requests:
+    original_http_request = http.request
+    def mock_http_request(method, url, body=None, headers=None):
+        print(f"[Mock] HTTP {method} to {url}")
+        print(f"   Headers: {headers}")
+        print(f"   Body: {body.decode('utf-8') if body else None}")
+
+        class MockResponse:
+            def __init__(self, status, data, headers=None):
+                self.status = status
+                self.data = json.dumps(data).encode('utf-8')
+                self.headers = headers or {}
+
+        if url == os.environ['AUTH_API_URL']:
+            # Mock successful auth
+            return MockResponse(200, {"access_token": "mocked_token_12345"})
+            # Mock failed auth
+            # return MockResponse(401, {"error": "invalid credentials"})
+
+        elif url == os.environ['TARGET_API_URL']:
+            if headers.get('Cookie') == 'session_token=mocked_token_12345':
+                 return MockResponse(200, {"message": "Data processed successfully by target API!", "received_payload": json.loads(body.decode('utf-8'))})
+            else:
+                return MockResponse(403, {"error": "Forbidden, bad token in cookie"})
+        return MockResponse(404, {"error": "Mock endpoint not found"})
+
+    http.request = mock_http_request
+
+    response = lambda_handler(mock_event, mock_context)
+    print("\n--- Lambda Response ---")
+    print(json.dumps(response, indent=2))
+
+    # Restore original functions if you were to run more tests
+    secrets_manager_client.get_secret_value = original_get_secret_value
+    http.request = original_http_request
