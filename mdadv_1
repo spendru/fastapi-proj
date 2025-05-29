@@ -1,0 +1,308 @@
+import json
+import os
+import requests # Using the requests library
+import boto3
+
+# Initialize the Secrets Manager client outside the handler
+secrets_manager_client = boto3.client('secretsmanager')
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler function.
+
+    Args:
+        event (dict): The event data passed to the Lambda function.
+        context (object): The Lambda runtime information.
+
+    Returns:
+        dict: The response from the second API call or an error message.
+    """
+    print(f"Received event: {json.dumps(event)}")
+
+    # --- 1. Configuration from Environment Variables ---
+    secret_name = os.environ.get('SECRET_NAME')
+    auth_api_url = os.environ.get('AUTH_API_URL') # URL to get the token
+    target_api_url = os.environ.get('TARGET_API_URL') # URL to call with the token
+    # Optional: specify the HTTP method for the target API if not POST
+    target_api_method = os.environ.get('TARGET_API_METHOD', 'POST').upper()
+
+
+    if not secret_name or not auth_api_url or not target_api_url:
+        print("Error: Environment variables SECRET_NAME, AUTH_API_URL, or TARGET_API_URL not set.")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'Configuration error: Missing environment variables.'})
+        }
+
+    try:
+        # --- 2. Retrieve Credentials from AWS Secrets Manager ---
+        print(f"Retrieving secret: {secret_name}")
+        get_secret_value_response = secrets_manager_client.get_secret_value(
+            SecretId=secret_name
+        )
+
+        secret_string = get_secret_value_response.get('SecretString')
+        if not secret_string:
+            print("Error: SecretString not found in secret.")
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': 'Could not parse credentials from Secrets Manager (SecretString missing).'})
+            }
+
+        secret = json.loads(secret_string)
+        username = secret.get('username')
+        password = secret.get('password')
+
+        if not username or not password:
+            print("Error: 'username' or 'password' not found in the secret JSON.")
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': "Credentials format error in Secrets Manager ('username' or 'password' missing)."})
+            }
+        print("Successfully retrieved credentials.")
+
+        # --- 3. Make REST API call to get the token (using requests) ---
+        auth_payload = {
+            'username': username,
+            'password': password
+            # Add any other required fields for your auth API
+            # e.g., 'grant_type': 'password', 'client_id': 'your_client_id'
+        }
+        auth_headers = {'Content-Type': 'application/json'}
+
+        print(f"Requesting token from: {auth_api_url} with payload: {json.dumps(auth_payload)}")
+        # Assuming the auth API expects a POST request with JSON body
+        # Adjust method (requests.post, requests.get) and data/params as needed
+        auth_response = requests.post(
+            auth_api_url,
+            json=auth_payload, # requests handles json.dumps internally for `json=`
+            headers=auth_headers,
+            timeout=10 # Set a reasonable timeout
+        )
+        auth_response.raise_for_status() # Raises an HTTPError for bad responses (4XX or 5XX)
+
+        auth_response_data = auth_response.json()
+        # --- IMPORTANT: Adapt this part based on your auth API's response structure ---
+        # Assuming the token is returned in a field named 'access_token', 'token', etc.
+        token = auth_response_data.get('access_token') or \
+                auth_response_data.get('token') or \
+                auth_response_data.get('id_token') # Common names for tokens
+
+        if not token:
+            print(f"Error: Token not found in auth response. Response: {auth_response_data}")
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': 'Token not found in authentication response.'})
+            }
+        print("Successfully obtained token.")
+
+        # --- 4. Create input JSON for the target API ---
+        # This will likely come from the 'event' or be constructed based on it.
+        # For this example, let's assume the input event IS the payload for the target API,
+        # or it's under a specific key like "target_payload".
+        if "target_payload" in event:
+            target_api_payload = event.get("target_payload")
+        else:
+            # If no 'target_payload' key, assume the whole event is the payload (minus any Lambda specific keys if necessary)
+            # Or, if the target API doesn't need a body (e.g., for GET), set to None
+            target_api_payload = event if target_api_method in ['POST', 'PUT', 'PATCH'] else None
+
+
+        # --- 5. Prepare Headers for the Target API Call (using Bearer Token) ---
+        target_api_headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {token}' # Using Bearer token
+            # Add any other required headers
+        }
+        print(f"Target API ({target_api_method}) headers: {target_api_headers}")
+        if target_api_payload:
+            print(f"Target API payload: {json.dumps(target_api_payload)}")
+        else:
+            print("Target API: No payload for this method.")
+
+
+        # --- 6. Invoke the Target REST API (using requests) ---
+        print(f"Calling target API: {target_api_url} with method: {target_api_method}")
+
+        if target_api_method == 'POST':
+            target_response = requests.post(
+                target_api_url,
+                json=target_api_payload, # Use json for automatic Content-Type: application/json
+                headers=target_api_headers,
+                timeout=15 # Set a reasonable timeout
+            )
+        elif target_api_method == 'GET':
+            target_response = requests.get(
+                target_api_url,
+                params=target_api_payload, # For GET, payload typically goes in query string params
+                headers=target_api_headers,
+                timeout=15
+            )
+        elif target_api_method == 'PUT':
+            target_response = requests.put(
+                target_api_url,
+                json=target_api_payload,
+                headers=target_api_headers,
+                timeout=15
+            )
+        # Add other methods (DELETE, PATCH) if needed
+        else:
+            print(f"Error: Unsupported TARGET_API_METHOD: {target_api_method}")
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': f"Unsupported HTTP method: {target_api_method}"})
+            }
+
+        target_response.raise_for_status() # Check for HTTP errors
+
+        print(f"Target API response status: {target_response.status_code}")
+        # Try to parse as JSON, fall back to text if not JSON
+        try:
+            response_body = target_response.json()
+        except requests.exceptions.JSONDecodeError:
+            response_body = target_response.text
+        print(f"Target API response data: {response_body}")
+
+
+        return {
+            'statusCode': target_response.status_code,
+            'body': json.dumps(response_body), # Ensure body is JSON stringified for API Gateway
+            'headers': dict(target_response.headers)
+        }
+
+    except secrets_manager_client.exceptions.ResourceNotFoundException:
+        print(f"Error: Secret '{secret_name}' not found.")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': f"Secret '{secret_name}' not found."})
+        }
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
+        return {
+            'statusCode': e.response.status_code,
+            'body': json.dumps({
+                'error': 'HTTP error during API call.',
+                'details': e.response.text
+            })
+        }
+    except requests.exceptions.RequestException as e: # Catches ConnectTimeout, ReadTimeout, etc.
+        print(f"Request exception occurred: {str(e)}")
+        return {
+            'statusCode': 500, # Or a more specific error code like 504 Gateway Timeout
+            'body': json.dumps({'error': 'Request failed to API.', 'details': str(e)})
+        }
+    except Exception as e:
+        print(f"An unexpected error occurred: {str(e)}")
+        # import traceback
+        # print(traceback.format_exc()) # For detailed debugging in CloudWatch
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'An unexpected error occurred.', 'details': str(e)})
+        }
+
+# --- Example Usage (for local testing, not part of Lambda deployment) ---
+if __name__ == '__main__':
+    # --- Mock AWS Environment Variables for local testing ---
+    os.environ['SECRET_NAME'] = "your/secret/name"
+    os.environ['AUTH_API_URL'] = "https://your-auth-api.com/token"
+    os.environ['TARGET_API_URL'] = "https://your-target-api.com/data"
+    os.environ['TARGET_API_METHOD'] = "POST" # Or "GET", "PUT"
+
+    # --- Mock Event ---
+    mock_event_post = {
+        "target_payload": {
+            "key1": "value1 from local test",
+            "key2": "value2 from local test"
+        }
+    }
+    mock_event_get = { # For GET, payload might be empty or used as query params
+        "target_payload": {
+            "query_param1": "search_term",
+            "limit": 10
+        }
+    }
+    # Choose which event to test with:
+    mock_event = mock_event_post if os.environ['TARGET_API_METHOD'] == 'POST' else mock_event_get
+
+    mock_context = {}
+    print("--- Simulating Lambda Execution (with requests) ---")
+
+    # --- Mocking Boto3 and Requests for local testing ---
+    original_get_secret_value = secrets_manager_client.get_secret_value
+    def mock_get_secret_value(SecretId):
+        print(f"[Mock Boto3] Getting secret for {SecretId}")
+        if SecretId == os.environ['SECRET_NAME']:
+            return {
+                'SecretString': json.dumps({
+                    'username': 'testuser',
+                    'password': 'testpassword'
+                })
+            }
+        raise secrets_manager_client.exceptions.ResourceNotFoundException(
+            {'Error': {'Code': 'ResourceNotFoundException', 'Message': 'Secret not found'}},
+            'GetSecretValue'
+        )
+    secrets_manager_client.get_secret_value = mock_get_secret_value
+
+    original_requests_post = requests.post
+    original_requests_get = requests.get # if you also test GET
+
+    class MockResponse:
+        def __init__(self, status_code, json_data=None, text_data=None, headers=None):
+            self.status_code = status_code
+            self._json_data = json_data
+            self.text = text_data if text_data is not None else (json.dumps(json_data) if json_data else "")
+            self.headers = headers or {'Content-Type': 'application/json'}
+
+        def json(self):
+            if self._json_data is None:
+                raise requests.exceptions.JSONDecodeError("No JSON object could be decoded", "", 0)
+            return self._json_data
+
+        def raise_for_status(self):
+            if 400 <= self.status_code < 600:
+                raise requests.exceptions.HTTPError(f"{self.status_code} Client/Server Error", response=self)
+
+    def mock_requests_post(url, json=None, data=None, headers=None, timeout=None):
+        print(f"[Mock Requests POST] to {url}")
+        print(f"   Headers: {headers}")
+        print(f"   JSON Payload: {json if json else data}") # `json` param is preferred for requests
+
+        if url == os.environ['AUTH_API_URL']:
+            if json and json.get('username') == 'testuser':
+                return MockResponse(200, json_data={"access_token": "mocked_bearer_token_123"})
+            else:
+                return MockResponse(401, json_data={"error": "invalid credentials from mock"})
+
+        elif url == os.environ['TARGET_API_URL']:
+            if headers.get('Authorization') == 'Bearer mocked_bearer_token_123':
+                return MockResponse(200, json_data={"message": "Data processed by target (POST)!", "received": json})
+            else:
+                return MockResponse(403, json_data={"error": "Forbidden, bad bearer token in mock"})
+        return MockResponse(404, json_data={"error": "Mock POST endpoint not found"})
+
+    def mock_requests_get(url, params=None, headers=None, timeout=None):
+        print(f"[Mock Requests GET] to {url}")
+        print(f"   Headers: {headers}")
+        print(f"   Params: {params}")
+
+        if url == os.environ['TARGET_API_URL']: # Assuming TARGET_API_URL is the same for GET
+            if headers.get('Authorization') == 'Bearer mocked_bearer_token_123':
+                return MockResponse(200, json_data={"message": "Data retrieved by target (GET)!", "filters_applied": params})
+            else:
+                return MockResponse(403, json_data={"error": "Forbidden, bad bearer token in mock GET"})
+        return MockResponse(404, json_data={"error": "Mock GET endpoint not found"})
+
+
+    requests.post = mock_requests_post
+    requests.get = mock_requests_get
+    # Add mocks for requests.put, requests.patch, etc. if you use them
+
+    response = lambda_handler(mock_event, mock_context)
+    print("\n--- Lambda Response ---")
+    print(json.dumps(response, indent=2))
+
+    # Restore original functions
+    secrets_manager_client.get_secret_value = original_get_secret_value
+    requests.post = original_requests_post
+    requests.get = original_requests_get
