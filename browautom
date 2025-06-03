@@ -1,0 +1,106 @@
+#Requires -Version 5.1
+
+<#
+.SYNOPSIS
+    Opens Microsoft Edge, navigates to myapps.microsoft.com,
+    and attempts to launch the "Amazon Web Services - SSO" application.
+
+.DESCRIPTION
+    This script starts Microsoft Edge, directs it to the Microsoft MyApps portal.
+    It then attempts to find and "click" the application tile for
+    "Amazon Web Services - SSO".
+
+    NOTE: This script assumes you are already authenticated to myapps.microsoft.com.
+    It does not handle the login process. The reliability of clicking the app
+    depends on the structure of the webpage and may require adjustments.
+
+.EXAMPLE
+    .\Launch-AWS-SSO.ps1
+#>
+
+param (
+    [string]$MyAppsURL = "https://myapps.microsoft.com",
+    [string]$AppName = "Amazon Web Services - SSO", # Adjust if the display name is slightly different
+    [int]$PageLoadDelay = 10 # Seconds to wait for the page to load
+)
+
+Write-Host "Attempting to open Microsoft Edge and navigate to '$MyAppsURL'..."
+
+try {
+    # Start Microsoft Edge and navigate to the MyApps portal
+    Start-Process -FilePath "msedge" -ArgumentList $MyAppsURL -ErrorAction Stop
+
+    Write-Host "Waiting '$($PageLoadDelay)' seconds for the page to load and for you to ensure you are logged in..."
+    Start-Sleep -Seconds $PageLoadDelay
+
+    Write-Host "Attempting to find and launch the application: '$AppName'..."
+    Write-Host "Please ensure the Microsoft Edge window is active and the MyApps page is fully loaded."
+
+    # This part is tricky and less reliable with PowerShell alone.
+    # It simulates 'Tab' navigation and 'Enter' to select.
+    # This assumes the app might be reachable via keyboard navigation.
+
+    # Bring Edge to the foreground (optional, but can help)
+    # This requires the window title to be somewhat predictable.
+    # You might need to adjust "Microsoft Edge" if your Edge window title is different.
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $edgeWindow = Get-Process | Where-Object {$_.ProcessName -eq "msedge" -and $_.MainWindowTitle -ne ""} | Select-Object -First 1
+        if ($edgeWindow) {
+            $shell.AppActivate($edgeWindow.MainWindowTitle)
+            Start-Sleep -Milliseconds 500 # Give it a moment to focus
+        }
+    }
+    catch {
+        Write-Warning "Could not reliably bring Edge to the foreground. Please ensure it's the active window."
+    }
+
+
+    # Attempting to interact with the page using COM object (Internet Explorer based)
+    # This method has limitations with modern Edge (Chromium based) for direct element clicking.
+    # For robust interaction with modern Edge, Selenium or Playwright are better choices.
+    # However, we can try to send keystrokes as a fallback.
+
+    Write-Host "Trying to simulate keyboard navigation. This is highly dependent on the page structure."
+    Write-Host "You might need to manually click the application if this part fails."
+
+    # Simplistic approach: Send 'Tab' a number of times and then 'Enter'.
+    # This is a GUESS. You'll likely need to experiment.
+    #
+    # 1. First, try to click it via accessibility name if possible (more direct if it works)
+    #    This requires UIAutomation module or similar, which is more complex.
+    #
+    # 2. Fallback to keystrokes:
+    #    The idea is to get focus into the search bar or the main app list
+    #    and then type the app name or tab to it.
+
+    # Let's try to send the app name as if typing into a search bar, then Enter.
+    # This assumes there's a search bar that gets focus or is easily focusable.
+    $wshell = New-Object -ComObject wscript.shell
+    Start-Sleep -Seconds 2 # Wait a bit more
+
+    # Try to type the app name (hoping a search field has focus or will pick it up)
+    $AppName.ToCharArray() | ForEach-Object {
+        $wshell.SendKeys("$_")
+        Start-Sleep -Milliseconds 100 # Small delay between keystrokes
+    }
+    Start-Sleep -Milliseconds 500
+    $wshell.SendKeys("{ENTER}") # Try to submit the search
+
+    Write-Host "Sent app name and Enter keystroke. Waiting for app to potentially appear and be selected..."
+    Start-Sleep -Seconds 5 # Wait for search results or navigation
+
+    # If the app is the first result or highlighted after search, another Enter might launch it.
+    $wshell.SendKeys("{ENTER}")
+
+    Write-Host "Attempted to launch '$AppName'. Please check the Edge window."
+    Write-Warning "If the app did not launch, you may need to click it manually."
+    Write-Warning "Robust web UI automation typically requires tools like Selenium or Playwright."
+
+}
+catch {
+    Write-Error "An error occurred: $($_.Exception.Message)"
+    Write-Error "Script execution failed."
+}
+
+# End of script
