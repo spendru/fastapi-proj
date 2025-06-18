@@ -1,0 +1,151 @@
+import json
+import os
+import requests
+import boto3
+import logging
+from datetime import datetime, timedelta, timezone
+
+# --- AWS Clients (initialized globally for reuse) ---
+s3_client = boto3.client('s3')
+secretsmanager_client = boto3.client('secretsmanager')
+
+# --- Environment Variables ---
+# Your original credentials for fetching a brand new token
+ORIGINAL_CREDENTIALS_SECRET_ARN = os.environ.get('ORIGINAL_CREDENTIALS_SECRET_ARN')
+TOKEN_URL = os.environ.get('TOKEN_URL')
+TARGET_API_URL = os.environ.get('TARGET_API_URL')
+# New environment variable for the secret that will store the *temporary API token*
+CACHED_TOKEN_SECRET_ARN = os.environ.get('CACHED_TOKEN_SECRET_ARN')
+# Optional with defaults
+TOKEN_COOKIE_NAME = os.environ.get('TOKEN_COOKIE_NAME', 'authToken')
+FILE_FORM_FIELD_NAME = os.environ.get('FILE_FORM_FIELD_NAME', 'file')
+
+
+# --- In-Memory Cache (Global Variables) ---
+in_memory_token_cache = {
+    "token": None,
+    "expiry": None
+}
+
+# Setup logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def get_cached_token():
+    """
+    Implements two-layer caching to retrieve a valid token.
+    Order: In-Memory -> AWS Secrets Manager -> Fetch New
+    """
+    # 1. Check in-memory cache first
+    if in_memory_token_cache.get("token") and in_memory_token_cache.get("expiry") > datetime.now(timezone.utc):
+        logger.info("Using valid token from IN-MEMORY cache.")
+        return in_memory_token_cache["token"]
+
+    # 2. If memory cache is invalid, check AWS Secrets Manager
+    if CACHED_TOKEN_SECRET_ARN:
+        try:
+            logger.info(f"Checking for token in Secrets Manager secret: {CACHED_TOKEN_SECRET_ARN}")
+            secret_response = secretsmanager_client.get_secret_value(SecretId=CACHED_TOKEN_SECRET_ARN)
+            secret_data = json.loads(secret_response['SecretString'])
+            expiry_time = datetime.fromisoformat(secret_data['expiry'])
+
+            if expiry_time > datetime.now(timezone.utc):
+                logger.info("Using valid token from SECRETS MANAGER cache.")
+                # Update in-memory cache for subsequent calls to this warm container
+                in_memory_token_cache['token'] = secret_data['token']
+                in_memory_token_cache['expiry'] = expiry_time
+                return secret_data['token']
+        except secretsmanager_client.exceptions.ResourceNotFoundException:
+            logger.info("Token secret not found. Will fetch a new one.")
+        except Exception as e:
+            logger.error(f"Error reading or parsing token from Secrets Manager. Will fetch a new one. Error: {e}")
+
+    # 3. If no valid cached token, fetch a new one
+    logger.info("No valid token in any cache. Fetching a new token from the API.")
+    # Get the long-lived credentials (username/password) to fetch a new token
+    credentials = get_long_lived_credentials(ORIGINAL_CREDENTIALS_SECRET_ARN)
+    new_token = fetch_new_auth_token(TOKEN_URL, credentials)
+
+    # The token expires in 24 hours. Set expiry with a 5-minute buffer for safety.
+    new_expiry_time = datetime.now(timezone.utc) + timedelta(hours=24, minutes=-5)
+    
+    # Update caches
+    in_memory_token_cache['token'] = new_token
+    in_memory_token_cache['expiry'] = new_expiry_time
+
+    if CACHED_TOKEN_SECRET_ARN:
+        try:
+            logger.info(f"Updating token in Secrets Manager secret: {CACHED_TOKEN_SECRET_ARN}")
+            secret_payload = json.dumps({
+                "token": new_token,
+                "expiry": new_expiry_time.isoformat()
+            })
+            secretsmanager_client.update_secret(
+                SecretId=CACHED_TOKEN_SECRET_ARN,
+                SecretString=secret_payload
+            )
+        except Exception as e:
+            # Log the error but don't fail the execution, as we have a valid token for the current run
+            logger.error(f"Failed to update token in Secrets Manager: {e}")
+
+    return new_token
+
+def get_long_lived_credentials(secret_arn):
+    """Retrieves the primary username/password used to get a token."""
+    try:
+        response = secretsmanager_client.get_secret_value(SecretId=secret_arn)
+        return json.loads(response['SecretString'])
+    except Exception as e:
+        logger.error(f"FATAL: Could not retrieve original credentials from {secret_arn}. Error: {e}")
+        raise
+
+def fetch_new_auth_token(token_url, credentials):
+    """The original function to fetch a token from the API."""
+    try:
+        username = credentials.get('username')
+        password = credentials.get('password')
+        if not username or not password: raise ValueError("Username or password missing")
+
+        auth_payload = {'username': username, 'password': password}
+        headers = {'Content-Type': 'application/json'}
+        
+        response = requests.post(token_url, json=auth_payload, headers=headers)
+        response.raise_for_status()
+        
+        token_data = response.json()
+        auth_token = token_data.get('access_token')
+        if not auth_token: raise ValueError("Access token not found in token API response")
+        
+        logger.info("Successfully fetched a new authentication token.")
+        return auth_token
+    except Exception as e:
+        logger.error(f"Failed to fetch new auth token: {e}")
+        raise
+
+# Your make_api_call_with_file function remains here, unchanged...
+def make_api_call_with_file(api_url, s3_bucket, s3_key, token, token_cookie_name, file_form_field_name, additional_form_data=None):
+    # ... (code from previous answer) ...
+# ... (rest of helper functions) ...
+
+# --- Main Handler ---
+def lambda_handler(event, context):
+    # ... (your existing initial code: logging, env var checks, event parsing) ...
+    try:
+        # 1. Get authentication token using the new caching logic
+        auth_token = get_cached_token()
+
+        # 2. Proceed with the main business logic
+        s3_details = event.get('s3_details')
+        s3_bucket = s3_details['bucket']
+        s3_key = s3_details['key']
+        additional_form_data = event.get('form_data')
+        
+        api_response = make_api_call_with_file(
+            TARGET_API_URL, s3_bucket, s3_key, auth_token, TOKEN_COOKIE_NAME,
+            FILE_FORM_FIELD_NAME, additional_form_data
+        )
+
+        return {'statusCode': 200, 'body': json.dumps(api_response)}
+    except Exception as e:
+        logger.error(f"Unhandled exception in lambda_handler: {e}", exc_info=True)
+        return {'statusCode': 500, 'body': json.dumps({'error': 'An internal server error occurred.'})}
