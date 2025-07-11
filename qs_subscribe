@@ -1,0 +1,104 @@
+import json
+import logging
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):
+    """
+    Handles incoming requests from API Gateway.
+    - Responds to Microsoft Graph subscription validation requests.
+    - Processes actual change notifications.
+    """
+    logger.info(f"Received event: {json.dumps(event)}")
+
+    # Microsoft Graph sends the validationToken as a query string parameter
+    query_params = event.get('queryStringParameters')
+
+    # --- 1. Handle Validation Request ---
+    if query_params and 'validationToken' in query_params:
+        validation_token = query_params['validationToken']
+        logger.info(f"Received validation request. Responding with token: {validation_token}")
+
+        # Respond with 200 OK, plain text content type, and the validation token in the body
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'text/plain'
+            },
+            'body': validation_token
+        }
+
+    # --- 2. Handle Actual Change Notification ---
+    else:
+        logger.info("Received change notification (not a validation request).")
+
+        # Check if body exists and is valid JSON
+        if 'body' not in event or not event['body']:
+             logger.warning("Notification received with empty or missing body.")
+             # Still return 200 OK or 202 Accepted to acknowledge receipt gracefully
+             return {
+                'statusCode': 200, # Or 202 Accepted if processing is async
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'message': 'Notification acknowledged (empty body)'})
+            }
+
+        try:
+            # The actual notification payload is in the request body
+            # API Gateway might pass it as a JSON string, so parse it
+            notification_data = json.loads(event['body'])
+            logger.info(f"Notification body: {json.dumps(notification_data)}")
+
+            # Extract clientState if you sent one during subscription for validation
+            if 'value' in notification_data and notification_data['value']:
+                client_state_received = notification_data['value'][0].get('clientState')
+                # TODO: Compare client_state_received with the one you expect
+                logger.info(f"Received clientState: {client_state_received}")
+                # if client_state_received != EXPECTED_CLIENT_STATE:
+                #     logger.error("ClientState mismatch! Potential spoofing.")
+                #     # Return an error or just ignore
+                #     return {'statusCode': 401, 'body': 'Unauthorized'}
+
+
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # TODO: Implement your core logic here!
+            # Process the notification_data['value'] array which contains
+            # details about the group membership changes.
+            # Example: Iterate through changes, extract user IDs, etc.
+            logger.info("Processing group membership change...")
+            # for change in notification_data.get('value', []):
+            #    resource_data = change.get('resourceData', {})
+            #    member_id = resource_data.get('id')
+            #    member_type = resource_data.get('@odata.type')
+            #    logger.info(f"Detected change for member ID: {member_id}, Type: {member_type}")
+            #    # Add your logic: call another service, update DB, etc.
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+
+            # Acknowledge receipt to Microsoft Graph (required)
+            # Typically respond with 202 Accepted if processing takes time,
+            # or 200 OK if processed quickly. Graph mainly cares about getting *a* success response.
+            return {
+                'statusCode': 202, # 202 Accepted is often preferred for webhooks
+                'headers': {
+                    'Content-Type': 'application/json'
+                },
+                'body': json.dumps({'message': 'Notification received and processing initiated'})
+            }
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode JSON body: {e}")
+            return {
+                'statusCode': 400, # Bad Request
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Invalid JSON format in request body'})
+            }
+        except Exception as e:
+            logger.error(f"Error processing notification: {e}", exc_info=True)
+             # Generic error response
+            return {
+                'statusCode': 500, # Internal Server Error
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Internal server error processing notification'})
+            }
