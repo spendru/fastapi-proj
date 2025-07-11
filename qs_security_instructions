@@ -1,0 +1,85 @@
+Here are the main approaches:
+
+Method 1: Using Microsoft Graph Change Notifications (Recommended for near real-time)
+
+This is the most direct "webhook-like" mechanism provided by Microsoft Graph. You subscribe to changes on a specific resource (in this case, the members of your target group), and Microsoft Graph sends notifications to your specified HTTPS endpoint when changes occur.
+
+High-Level Steps:
+
+Prepare your AWS Lambda & API Gateway:
+
+Create your AWS Lambda function that contains the logic you want to execute.
+
+Expose this Lambda function via an AWS API Gateway endpoint. This endpoint must be publicly accessible HTTPS. This URL will be your notification endpoint for Microsoft Graph.
+
+Create an Azure AD Application Registration:
+
+You need an identity in Azure AD to authenticate requests to Microsoft Graph for creating and managing the subscription.
+
+Go to the Azure Portal -> Azure Active Directory (or Microsoft Entra ID) -> App registrations -> New registration.
+
+Give it a name (e.g., GroupMembershipNotifierApp).
+
+Configure authentication (e.g., create a client secret or certificate). You'll need these credentials later.
+
+Grant Permissions to the App Registration:
+
+Go to the API permissions section of your App registration.
+
+Add permissions for Microsoft Graph:
+
+Application permissions (since this will run without a signed-in user):
+
+GroupMember.Read.All (or Group.Read.All if you need more group info): To read group memberships.
+
+Subscription.ReadWrite.All: To create, manage, and delete change notification subscriptions.
+
+Grant admin consent for these permissions in your tenant.
+
+Create the Change Notification Subscription:
+
+This is typically done via a script (PowerShell with Microsoft.Graph module, Python with MSAL/Requests, etc.) or an application using the Microsoft Graph API.
+
+You'll make a POST request to the https://graph.microsoft.com/v1.0/subscriptions endpoint.
+
+Request Body Essentials:
+
+changeType: "created" (if you only want additions. Use "updated" for additions and removals).
+
+notificationUrl: Your AWS API Gateway endpoint URL.
+
+resource: /groups/{group-id}/members (Replace {group-id} with the Object ID of your target Azure AD group).
+
+expirationDateTime: Maximum is usually around 3 days (check current Graph limits). You must plan to renew the subscription before it expires.
+
+clientState: An optional secret string you provide, which Graph will include in notifications, allowing you to verify their authenticity.
+
+Handle the Validation Request (Crucial):
+
+When you create the subscription, Microsoft Graph will immediately send a validation request (HTTP POST) to your notificationUrl (API Gateway).
+
+Your API Gateway/Lambda function must detect this request (it contains a validationToken query parameter).
+
+It must respond within 10 seconds with:
+
+Status Code: 200 OK
+
+Content-Type: text/plain
+
+Body: The exact validationToken value received.
+
+Failure to validate correctly will prevent the subscription from being created.
+
+Process Notifications in AWS Lambda:
+
+Once validated, Graph will send POST requests to your API Gateway endpoint whenever a user is added (or removed, if changeType is "updated") to the group.
+
+The request body contains information about the change, including the resource that changed (the group membership).
+
+Your Lambda function needs to parse this payload and execute your desired logic.
+
+You should also validate the clientState if you provided one during subscription.
+
+Implement Subscription Renewal:
+
+Graph subscriptions expire. You need a mechanism (e.g., a scheduled task, another Lambda/Function) that periodically uses the Graph API to renew (PATCH) the subscription before its expirationDateTime.
