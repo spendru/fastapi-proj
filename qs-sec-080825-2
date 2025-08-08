@@ -1,0 +1,352 @@
+Of course. Let's add the functionality to perform a full synchronization, which includes unregistering users from QuickSight and removing them from the specified group if they are no longer in the source Azure AD group.
+
+This fundamentally changes the script's logic from "add-only" to a "full sync." It will now perform three main operations:
+
+Add: New users in the Azure AD group are registered in QuickSight and added to the QuickSight group.
+
+Keep: Users in both the Azure AD group and the QuickSight group are left untouched.
+
+Remove: Users who are in the QuickSight group but have been removed from the Azure AD group will be removed from the QuickSight group and then unregistered (deleted) from QuickSight.
+
+To prevent accidental deletions, we'll add a safety flag environment variable, ENABLE_DELETE. Deletions will only occur if this is set to 'true'.
+
+IAM Role and Configuration Updates
+1. New Lambda Environment Variable
+You must add this new environment variable to your Lambda configuration.
+
+Key	Value	Description
+ENABLE_DELETE	true or false	(Default: false) Set to 'true' to allow the function to remove and unregister users. This is a critical safety feature.
+
+Export to Sheets
+2. Updated IAM Permissions
+You must add the following permissions to your Lambda function's execution role in IAM.
+
+quicksight:ListGroupMemberships
+
+quicksight:DeleteGroupMembership
+
+quicksight:DeleteUser
+
+Your full QuickSight policy should now look something like this:
+
+JSON
+
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "quicksight:RegisterUser",
+                "quicksight:DescribeUser",
+                "quicksight:ListGroupMemberships",
+                "quicksight:CreateGroupMembership",
+                "quicksight:DeleteGroupMembership",
+                "quicksight:DeleteUser"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+(Note: Scoping Resource to specific ARNs is best practice where possible).
+
+Updated lambda_function.py
+Here is the complete, updated code. The primary changes are in the lambda_handler, which now orchestrates the full sync, and the addition of new helper functions for the "remove" operations.
+
+Python
+
+import json
+import logging
+import os
+import boto3
+from botocore.exceptions import ClientError
+import msal  # Must be included in the Lambda deployment package
+import requests # Must be included in the Lambda deployment package
+
+# --- Logging Setup ---
+logger = logging.getLogger()
+log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logger.setLevel(log_level)
+logger.info("Lambda function initializing...")
+
+# --- Configuration (from Environment Variables) ---
+# Azure AD Config
+AZURE_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID")
+AZURE_TENANT_ID = os.environ.get("AZURE_TENANT_ID")
+AZURE_GROUP_ID = os.environ.get("AZURE_GROUP_ID")
+AZURE_CLIENT_SECRET_NAME = os.environ.get("AZURE_CLIENT_SECRET_NAME")
+
+# AWS Config
+AWS_ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID")
+AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", boto3.session.Session().region_name)
+
+# QuickSight Config
+QUICKSIGHT_IAM_ARN = os.environ.get("QUICKSIGHT_IAM_ARN")
+QUICKSIGHT_USER_ROLE = os.environ.get("QUICKSIGHT_USER_ROLE", "READER")
+QUICKSIGHT_NAMESPACE = os.environ.get("QUICKSIGHT_NAMESPACE", "default")
+QUICKSIGHT_TARGET_GROUP_NAME = os.environ.get("QUICKSIGHT_TARGET_GROUP_NAME")
+
+# New Safety Flag for Deletion
+ENABLE_DELETE = os.environ.get("ENABLE_DELETE", "false").lower() == 'true'
+
+# Azure AD Attributes to fetch
+AZURE_ATTRIBUTES_TO_SELECT = ["id", "displayName", "userPrincipalName", "mail"]
+
+
+# --- Existing Helper Functions (get_secret, get_azure_ad_access_token, etc.) ---
+# These functions remain the same as the previous version. They are included here for completeness.
+
+def get_secret(secret_name, region_name):
+    logger.info(f"Attempting to retrieve secret: {secret_name}")
+    client = boto3.client(service_name='secretsmanager', region_name=region_name)
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+        logger.info(f"Successfully retrieved secret: {secret_name}")
+        return get_secret_value_response.get('SecretString')
+    except ClientError as e:
+        logger.error(f"Error retrieving secret {secret_name}: {e}")
+        raise e
+
+def get_azure_ad_access_token(client_id, client_secret, tenant_id):
+    logger.info("Acquiring Azure AD access token...")
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    app = msal.ConfidentialClientApplication(
+        client_id, authority=authority, client_credential=client_secret
+    )
+    result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+    if "access_token" in result:
+        return result['access_token']
+    else:
+        logger.error(f"Error acquiring Azure AD token: {result.get('error_description')}")
+        raise Exception("Failed to acquire Azure AD access token")
+
+def get_azure_group_members(access_token, group_id, attributes):
+    logger.info(f"Fetching Azure AD members for group ID: {group_id}...")
+    members = {}
+    select_query = ",".join(attributes)
+    graph_api_endpoint = "https://graph.microsoft.com/v1.0"
+    headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+    url = f"{graph_api_endpoint}/groups/{group_id}/members?$select={select_query}&$top=999"
+
+    while url:
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            for member in data.get("value", []):
+                # Use email as the key for easy lookup
+                if 'mail' in member and member['mail']:
+                    members[member['mail'].lower()] = member
+            url = data.get("@odata.nextLink")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HTTP Request failed fetching Azure members: {e}")
+            raise
+
+    logger.info(f"Successfully retrieved {len(members)} members with email from Azure AD.")
+    return members
+
+# --- QuickSight User Management Functions ---
+
+def register_quicksight_user(qs_client, aws_account_id, iam_arn, email, session_name, user_role, namespace):
+    try:
+        response = qs_client.register_user(
+            AwsAccountId=aws_account_id, Namespace=namespace, IdentityType='IAM',
+            IamArn=iam_arn, SessionName=session_name, Email=email, UserRole=user_role
+        )
+        return True, response.get('User', {})
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceExistsException':
+            return False, "User already exists"
+        logger.error(f"AWS Error registering user '{email}': {e}")
+        return False, f"AWS Error: {e.response['Error']['Code']}"
+
+def add_user_to_quicksight_group(qs_client, aws_account_id, group_name, user_name, namespace):
+    try:
+        qs_client.create_group_membership(
+            MemberName=user_name, GroupName=group_name, AwsAccountId=aws_account_id, Namespace=namespace
+        )
+        return True, "Added successfully"
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceExistsException':
+            return False, "User already in group"
+        logger.error(f"AWS Error adding user '{user_name}' to group '{group_name}': {e}")
+        return False, f"AWS Error: {e.response['Error']['Code']}"
+
+def get_quicksight_group_members_with_email(qs_client, aws_account_id, group_name, namespace):
+    logger.info(f"Fetching members from QuickSight group: {group_name}")
+    members = {}
+    paginator = qs_client.get_paginator('list_group_memberships')
+    try:
+        for page in paginator.paginate(AwsAccountId=aws_account_id, GroupName=group_name, Namespace=namespace):
+            for member in page.get('GroupMemberList', []):
+                # Now we need to describe the user to get their email
+                member_arn = member.get('Arn')
+                if member_arn:
+                    try:
+                        user_details_response = qs_client.describe_user(
+                            UserArn=member_arn, AwsAccountId=aws_account_id, Namespace=namespace
+                        )
+                        user_details = user_details_response.get('User', {})
+                        if 'Email' in user_details and user_details['Email']:
+                            # Map the user's email to their QuickSight details
+                            members[user_details['Email'].lower()] = user_details
+                    except ClientError as e:
+                        logger.warning(f"Could not describe user with ARN {member_arn}: {e}")
+    except ClientError as e:
+        logger.error(f"Could not list members for group {group_name}: {e}")
+        raise # This is a critical failure for the sync logic
+
+    logger.info(f"Found {len(members)} members with email in QuickSight group {group_name}.")
+    return members
+
+def remove_user_from_quicksight_group(qs_client, aws_account_id, group_name, user_name, namespace):
+    logger.info(f"Removing QuickSight user '{user_name}' from group '{group_name}'")
+    try:
+        qs_client.delete_group_membership(
+            MemberName=user_name, GroupName=group_name, AwsAccountId=aws_account_id, Namespace=namespace
+        )
+        return True, "Removed successfully"
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            return False, "User not found in group"
+        logger.error(f"AWS Error removing user '{user_name}' from group '{group_name}': {e}")
+        return False, f"AWS Error: {e.response['Error']['Code']}"
+
+def delete_quicksight_user(qs_client, aws_account_id, user_name, namespace):
+    logger.info(f"Deleting (unregistering) QuickSight user '{user_name}'")
+    try:
+        qs_client.delete_user(
+            UserName=user_name, AwsAccountId=aws_account_id, Namespace=namespace
+        )
+        return True, "Deleted successfully"
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            return False, "User not found"
+        logger.error(f"AWS Error deleting user '{user_name}': {e}")
+        return False, f"AWS Error: {e.response['Error']['Code']}"
+
+# --- Lambda Handler (Main Logic) ---
+def lambda_handler(event, context):
+    logger.info(f"Lambda Request ID: {context.aws_request_id}. Event: {json.dumps(event)}")
+    # --- Configuration Validation ---
+    if not all([AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_GROUP_ID, AZURE_CLIENT_SECRET_NAME, AWS_ACCOUNT_ID, QUICKSIGHT_IAM_ARN, QUICKSIGHT_TARGET_GROUP_NAME]):
+        error_msg = "Missing critical configuration environment variables."
+        logger.critical(error_msg)
+        return {'statusCode': 400, 'body': json.dumps({'message': error_msg})}
+
+    # --- Initialize Counters ---
+    stats = {
+        "added": 0, "add_failed": 0, "already_existed": 0,
+        "group_added": 0, "group_add_failed": 0, "already_in_group": 0,
+        "removed_from_group": 0, "group_remove_failed": 0,
+        "deleted": 0, "delete_failed": 0
+    }
+    
+    try:
+        # --- Initialize Clients ---
+        azure_client_secret = get_secret(AZURE_CLIENT_SECRET_NAME, AWS_REGION)
+        azure_token = get_azure_ad_access_token(AZURE_CLIENT_ID, azure_client_secret, AZURE_TENANT_ID)
+        qs_client = boto3.client('quicksight', region_name=AWS_REGION)
+
+        # 1. Fetch Source of Truth: Get users from Azure AD and QuickSight Group
+        azure_users = get_azure_group_members(azure_token, AZURE_GROUP_ID, AZURE_ATTRIBUTES_TO_SELECT)
+        quicksight_users = get_quicksight_group_members_with_email(qs_client, AWS_ACCOUNT_ID, QUICKSIGHT_TARGET_GROUP_NAME, QUICKSIGHT_NAMESPACE)
+
+        azure_emails = set(azure_users.keys())
+        quicksight_emails = set(quicksight_users.keys())
+
+        # 2. Determine who to ADD and who to REMOVE
+        emails_to_add = azure_emails - quicksight_emails
+        emails_to_remove = quicksight_emails - azure_emails
+
+        logger.info(f"Sync plan: Add {len(emails_to_add)} user(s). Remove {len(emails_to_remove)} user(s). Keep {len(azure_emails.intersection(quicksight_emails))} user(s).")
+        
+        # 3. --- Process REMOVALS ---
+        if ENABLE_DELETE:
+            logger.warning(f"Deletion is ENABLED. Processing {len(emails_to_remove)} removal(s)...")
+            for email in emails_to_remove:
+                user_details = quicksight_users[email]
+                qs_user_name = user_details.get('UserName')
+                if not qs_user_name:
+                    logger.error(f"Cannot remove user with email '{email}': Missing UserName in QuickSight details.")
+                    stats["delete_failed"] += 1
+                    continue
+
+                # Step 3a: Remove from group
+                rm_success, rm_msg = remove_user_from_quicksight_group(qs_client, AWS_ACCOUNT_ID, QUICKSIGHT_TARGET_GROUP_NAME, qs_user_name, QUICKSIGHT_NAMESPACE)
+                if rm_success:
+                    stats["removed_from_group"] += 1
+                elif rm_msg != "User not found in group": # Don't count "not found" as a failure
+                    stats["group_remove_failed"] += 1
+
+                # Step 3b: Delete user from QuickSight
+                del_success, del_msg = delete_quicksight_user(qs_client, AWS_ACCOUNT_ID, qs_user_name, QUICKSIGHT_NAMESPACE)
+                if del_success:
+                    stats["deleted"] += 1
+                elif del_msg != "User not found": # Don't count "not found" as a failure
+                    stats["delete_failed"] += 1
+        elif len(emails_to_remove) > 0:
+            logger.warning(f"Deletion is DISABLED. Skipping removal of {len(emails_to_remove)} user(s). Set ENABLE_DELETE=true to process removals.")
+
+        # 4. --- Process ADDITIONS ---
+        logger.info(f"Processing {len(emails_to_add)} addition(s)...")
+        for email in emails_to_add:
+            azure_user = azure_users[email]
+            session_name = azure_user.get('userPrincipalName') or azure_user.get('displayName')
+
+            if not session_name:
+                logger.warning(f"Cannot add user with email '{email}': Missing userPrincipalName and displayName.")
+                stats["add_failed"] += 1
+                continue
+            
+            # Step 4a: Register user
+            reg_success, reg_result = register_quicksight_user(qs_client, AWS_ACCOUNT_ID, QUICKSIGHT_IAM_ARN, email, session_name, QUICKSIGHT_USER_ROLE, QUICKSIGHT_NAMESPACE)
+            
+            qs_user_details = None
+            if reg_success:
+                stats["added"] += 1
+                qs_user_details = reg_result
+            elif reg_result == "User already exists":
+                stats["already_existed"] += 1
+                # If user exists but wasn't in the group, we need their details to add them
+                # Note: This path should be rare if our sync logic is correct, but handles edge cases.
+                constructed_user_name = f"{QUICKSIGHT_IAM_ARN}/{session_name}"
+                try:
+                    user_desc = qs_client.describe_user(UserName=constructed_user_name, AwsAccountId=AWS_ACCOUNT_ID, Namespace=QUICKSIGHT_NAMESPACE)
+                    qs_user_details = user_desc.get('User')
+                except ClientError as e:
+                    logger.error(f"Could not describe existing user for group add: '{email}'. Error: {e}")
+            else:
+                stats["add_failed"] += 1
+                continue
+
+            # Step 4b: Add to group
+            if qs_user_details and qs_user_details.get('UserName'):
+                group_add_success, group_add_msg = add_user_to_quicksight_group(qs_client, AWS_ACCOUNT_ID, QUICKSIGHT_TARGET_GROUP_NAME, qs_user_details['UserName'], QUICKSIGHT_NAMESPACE)
+                if group_add_success:
+                    stats["group_added"] += 1
+                elif group_add_msg == "User already in group":
+                    stats["already_in_group"] += 1
+                else:
+                    stats["group_add_failed"] += 1
+            elif reg_success or reg_result == "User already exists":
+                logger.error(f"Could not get QuickSight details for user '{email}' to add them to the group.")
+                stats["group_add_failed"] += 1
+
+    except Exception as e:
+        logger.critical(f"Lambda execution failed critically: {e}", exc_info=True)
+        return {'statusCode': 500, 'body': json.dumps({'message': f"Critical error: {str(e)}", "stats": stats})}
+
+    # --- Return Final Summary ---
+    summary = {
+        'message': "Synchronization complete.",
+        'stats': stats,
+        'config': {
+            'deletion_enabled': ENABLE_DELETE
+        }
+    }
+    logger.info(f"Execution Summary: {json.dumps(summary)}")
+    return {
+        'statusCode': 200,
+        'body': json.dumps(summary)
+    }
