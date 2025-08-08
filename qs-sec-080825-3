@@ -1,0 +1,243 @@
+Of course. Implementing subscription renewal is a critical step for ensuring your webhook remains active.
+
+You'll automate this by creating a second, separate AWS Lambda function that runs on a schedule. This function's only job is to tell Microsoft Graph to extend your subscription's lifetime before it expires.
+
+Here’s the architecture:
+
+A scheduled Amazon EventBridge rule will trigger a Renewal Lambda function once a day. This function retrieves your stored subscription ID, gets a fresh access token, and makes a PATCH request to the Graph API to update the expiration date.
+
+## Step 1: Store Your Subscription ID After Creation
+First, you need to modify your initial subscription creation script to save the id you get back from Microsoft. A great place to store this is in AWS Systems Manager (SSM) Parameter Store, as it's simple and secure.
+
+Here's how you'd add it to the creation script from our previous discussion:
+
+Python
+
+# (Inside your original creation script, after the successful 'requests.post' call)
+
+# --- Process Success ---
+print("Subscription created successfully!")
+subscription_details = response.json()
+subscription_id = subscription_details.get('id')
+
+if subscription_id:
+    print(f"Subscription ID: {subscription_id}")
+    
+    # --- ADD THIS PART ---
+    # Store the ID in SSM Parameter Store
+    try:
+        ssm_client = boto3.client('ssm')
+        param_store_name = "/graph-webhooks/group-membership/subscription-id"
+        
+        ssm_client.put_parameter(
+            Name=param_store_name,
+            Value=subscription_id,
+            Type='SecureString', # Use SecureString for sensitive IDs
+            Overwrite=True
+        )
+        print(f"Successfully stored subscription ID in SSM Parameter Store: {param_store_name}")
+    except Exception as e:
+        print(f"ERROR: Failed to store subscription ID in SSM. {e}")
+    # --- END OF ADDED PART ---
+
+## Step 2: Create the Renewal Lambda Function
+Now, create a new, separate Lambda function in AWS. This function will contain the renewal logic.
+
+IAM Role Permissions: The IAM role for this Lambda will need permissions to:
+
+Read from SSM Parameter Store (ssm:GetParameter).
+
+(Optional but recommended) Read from AWS Secrets Manager if you store your app credentials there (secretsmanager:GetSecretValue).
+
+Write logs to CloudWatch (logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents).
+
+Here is the Python code for your renewal Lambda:
+
+Python
+
+import os
+import json
+import requests
+import boto3
+from datetime import datetime, timedelta
+
+# --- Configuration ---
+# You'll need to securely provide these, e.g., via environment variables or Secrets Manager
+TENANT_ID = os.environ.get("TENANT_ID")
+CLIENT_ID = os.environ.get("CLIENT_ID")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET") # Best practice: store in Secrets Manager
+
+# The SSM Parameter Store name where you stored the subscription ID
+PARAM_STORE_NAME = "/graph-webhooks/group-membership/subscription-id"
+
+def get_graph_access_token():
+    """Authenticates with Azure AD to get an access token."""
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    payload = {
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'scope': 'https://graph.microsoft.com/.default',
+        'grant_type': 'client_credentials'
+    }
+    response = requests.post(url, data=payload)
+    response.raise_for_status()
+    return response.json()['access_token']
+
+def lambda_handler(event, context):
+    """
+    Retrieves a subscription ID from Parameter Store and renews it with Microsoft Graph.
+    """
+    print("Starting Microsoft Graph subscription renewal process...")
+    ssm_client = boto3.client('ssm')
+
+    # --- 1. Get Subscription ID from SSM ---
+    try:
+        param = ssm_client.get_parameter(Name=PARAM_STORE_NAME, WithDecryption=True)
+        subscription_id = param['Parameter']['Value']
+        print(f"Retrieved subscription ID: {subscription_id}")
+    except ssm_client.exceptions.ParameterNotFound:
+        print(f"ERROR: Subscription ID not found in Parameter Store at '{PARAM_STORE_NAME}'. Aborting.")
+        # Optionally, you could trigger an alarm here.
+        return {'statusCode': 500, 'body': 'Subscription ID not configured.'}
+    except Exception as e:
+        print(f"ERROR retrieving from SSM: {e}")
+        raise e
+
+    # --- 2. Get a fresh Access Token ---
+    try:
+        access_token = get_graph_access_token()
+    except Exception as e:
+        print(f"ERROR getting access token: {e}")
+        raise e
+
+    # --- 3. Prepare and send the PATCH request to renew ---
+    graph_url = f"https://graph.microsoft.com/v1.0/subscriptions/{subscription_id}"
+    
+    # Calculate a new expiration time (e.g., 70 hours from now)
+    new_expiration = (datetime.utcnow() + timedelta(hours=70)).isoformat() + "Z"
+    
+    renewal_body = {
+        "expirationDateTime": new_expiration
+    }
+    
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        print(f"Sending PATCH request to renew subscription until {new_expiration}")
+        response = requests.patch(graph_url, headers=headers, json=renewal_body)
+        response.raise_for_status()  # Raises an HTTPError for bad responses (4xx or 5xx)
+
+        updated_sub = response.json()
+        print("Successfully renewed subscription!")
+        print(f"New expiration: {updated_sub['expirationDateTime']}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(updated_sub)
+        }
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP ERROR during renewal: {e.response.status_code} - {e.response.text}")
+        # If the subscription was deleted, the response is often 404 Not Found
+        if e.response.status_code == 404:
+            print("The subscription may have been deleted in Azure. Consider re-creating it.")
+        raise e
+
+## Step 3: Schedule the Lambda with Amazon EventBridge
+Finally, you need to set up the schedule that automatically runs the renewal function.
+
+Navigate to the Amazon EventBridge service in the AWS Console.
+
+Under "Buses," select "Rules" and click Create rule.
+
+Define rule detail:
+
+Name: Give it a clear name, like Renew-Graph-Subscription-Daily.
+
+Rule type: Select Schedule.
+
+Define schedule:
+
+Choose Recurring schedule.
+
+Use a cron expression to run it once a day. A daily schedule is more than enough.
+
+Example: cron(0 18 * * ? *) runs the function every day at 6:00 PM UTC.
+
+Select targets:
+
+Target type: AWS service
+
+Select a target: Choose Lambda function.
+
+Function: Select the renewal Lambda function you just created.
+
+Click Next through the remaining steps and then Create rule.
+
+That's it! Now, once a day, EventBridge will trigger your Lambda, which will get a new token, find your subscription ID, and send a request to Graph to extend its life, ensuring your webhook integration remains reliable.
+
+
+
+
+
+
+
+can this subscription send event when an user is removed from the group
+
+
+
+Show thinking
+Yes, it absolutely can.
+
+To receive notifications for both additions and removals, you just need to change the changeType property in your subscription payload from "created" to "updated".
+
+In the context of a group's membership, Microsoft Graph treats the list of members as a collection. Therefore, both adding a member and removing a member are considered an "update" to that collection.
+
+How to Configure It
+In your Python script where you create the subscription, simply modify this one line:
+
+Original (for additions only):
+
+Python
+
+subscription_payload = {
+    "changeType": "created",
+    # ... other properties
+}
+Updated (for additions AND removals):
+
+Python
+
+subscription_payload = {
+    "changeType": "updated",
+    "notificationUrl": NOTIFICATION_URL,
+    "resource": f"/groups/{GROUP_ID}/members",
+    "expirationDateTime": expiration_datetime,
+    "clientState": CLIENT_STATE,
+    "latestSupportedTlsVersion": "v1_2"
+}
+How to Handle the Notification
+When a user is removed, your notification-handling Lambda will still receive a POST request. The payload will include a @removed object that indicates the resource was deleted.
+
+Your Lambda function should check for this key to differentiate between an addition and a removal.
+
+Example Lambda Logic Snippet:
+
+Python
+
+# Inside your notification-handling Lambda
+notification_data = json.loads(event['body'])
+changes = notification_data.get('value', [])
+
+for change in changes:
+    # A removed member will have the '@removed' key
+    if '@removed' in change:
+        reason = change['@removed'].get('reason')
+        print(f"✅ User REMOVED. Reason: {reason}")
+        # >> Add your user removal logic here <<
+    else:
+        # This is an added or updated member
+        print("✅ User ADDED.")
+        # >> Add your user addition logic here <<
