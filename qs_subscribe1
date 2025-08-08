@@ -1,0 +1,84 @@
+import requests
+import datetime
+import uuid
+
+# --- Configuration ---
+ACCESS_TOKEN = "YOUR_ACCESS_TOKEN_HERE"  # Replace with your actual bearer token
+GROUP_ID = "YOUR_TARGET_GROUP_ID_HERE" # Replace with the Object ID of the AAD group
+NOTIFICATION_URL = "YOUR_API_GATEWAY_URL_HERE" # Replace with your AWS API Gateway HTTPS endpoint
+# Optional but recommended: A secret state value to validate notifications
+CLIENT_STATE = f"SecretClientState_{uuid.uuid4()}"
+# Set the desired lifetime (check Graph documentation for current maximum, typically around 3 days)
+# Let's set it for slightly less than 3 days (e.g., 70 hours) to be safe.
+SUBSCRIPTION_LIFETIME_HOURS = 70
+
+# --- Microsoft Graph API Details ---
+GRAPH_API_ENDPOINT = "https://graph.microsoft.com/v1.0/subscriptions"
+
+# --- Prepare Request ---
+
+# Calculate expiration datetime in ISO 8601 UTC format
+expiration_datetime = (
+    datetime.datetime.utcnow() + datetime.timedelta(hours=SUBSCRIPTION_LIFETIME_HOURS)
+).isoformat() + "Z" # Append 'Z' for UTC timezone indicator
+
+# Define the subscription payload
+subscription_payload = {
+    "changeType": "created",  # Use "created" for only additions. Use "updated" for additions and removals.
+    "notificationUrl": NOTIFICATION_URL,
+    "resource": f"/groups/{GROUP_ID}/members", # Target the members collection of the specific group
+    "expirationDateTime": expiration_datetime,
+    "clientState": CLIENT_STATE, # Optional: Used to verify the origin of notifications
+    "latestSupportedTlsVersion": "v1_2" # Recommended: Specify TLS version
+}
+
+# Define request headers
+headers = {
+    "Authorization": f"Bearer {ACCESS_TOKEN}",
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+}
+
+# --- Make the API Call ---
+try:
+    response = requests.post(
+        GRAPH_API_ENDPOINT,
+        headers=headers,
+        json=subscription_payload # requests library handles JSON serialization
+    )
+
+    # Check response status code
+    response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+
+    # --- Process Success ---
+    print("Subscription created successfully!")
+    print("---")
+    subscription_details = response.json()
+    print(f"Subscription ID: {subscription_details.get('id')}")
+    print(f"Resource: {subscription_details.get('resource')}")
+    print(f"Expiration: {subscription_details.get('expirationDateTime')}")
+    print(f"Client State: {subscription_details.get('clientState')}") # Should match the one you sent
+    print("---")
+    print(f"IMPORTANT: Microsoft Graph is now sending a validation request to:")
+    print(f"           {NOTIFICATION_URL}")
+    print(f"           Your endpoint MUST respond within 10 seconds with HTTP 200 OK")
+    print(f"           and the validation token in the response body (plain text).")
+    print("---")
+    print("Remember to implement a mechanism to RENEW this subscription before it expires.")
+
+
+except requests.exceptions.RequestException as e:
+    # --- Process Error ---
+    print(f"Error creating subscription:")
+    if e.response is not None:
+        print(f"Status Code: {e.response.status_code}")
+        try:
+            error_details = e.response.json()
+            print(f"Error Response: {error_details}")
+        except ValueError: # Handle cases where response is not JSON
+            print(f"Error Response (non-JSON): {e.response.text}")
+    else:
+        print(f"An error occurred: {e}")
+
+except Exception as ex:
+    print(f"An unexpected error occurred: {ex}")
