@@ -1,0 +1,65 @@
+def lambda_handler(event, context):
+    """
+    Handles webhook notifications by parsing the members@delta array
+    and fetching details for changed users.
+    """
+    logger.info("Received event, processing notification...")
+
+    try:
+        # Get a fresh access token for making Graph API calls
+        access_token = get_graph_access_token()
+    except Exception as e:
+        logger.error(f"FATAL: Could not get Graph API access token. {e}")
+        return {'statusCode': 500, 'body': 'Authentication failed'}
+
+    try:
+        notification_data = json.loads(event['body'])
+        # The 'value' key contains a list of change events
+        changes = notification_data.get('value', [])
+
+        # 1. Loop through each notification event (usually just one)
+        for change in changes:
+            resource_data = change.get('resourceData', {})
+            
+            # 2. Find the list of member changes inside the 'members@delta' key
+            member_changes = resource_data.get('members@delta', [])
+            
+            if not member_changes:
+                logger.info("Notification received, but no member changes found in members@delta.")
+                continue
+
+            # 3. Loop through each individual member change
+            for member_change in member_changes:
+                # Check if the member was removed. A removed member has an '@removed' key.
+                if '@removed' in member_change:
+                    member_id = member_change.get('id')
+                    reason = member_change['@removed'].get('reason')
+                    logger.info(f"✅ User REMOVED. Reason: {reason}. Member ID: {member_id}")
+                    # >> Add your user removal logic here <<
+                
+                # Otherwise, the member was added
+                else:
+                    member_id = member_change.get('id')
+                    if not member_id:
+                        continue
+
+                    logger.info(f"✅ User ADDED. Fetching details for member ID: {member_id}")
+                    user_details = get_user_details(member_id, access_token)
+                    
+                    if user_details:
+                        displayName = user_details.get('displayName')
+                        upn = user_details.get('userPrincipalName')
+                        mail = user_details.get('mail')
+                        
+                        logger.info(f"--> Display Name: {displayName}")
+                        logger.info(f"--> User Principal Name: {upn}")
+                        logger.info(f"--> Email: {mail}")
+                        
+                        # >> YOUR CORE LOGIC TO PROCESS THE NEW USER GOES HERE <<
+
+        # Acknowledge receipt of the notification to prevent retries
+        return {'statusCode': 202, 'body': 'Notification processed'}
+
+    except Exception as e:
+        logger.error(f"Error processing notification: {e}", exc_info=True)
+        return {'statusCode': 500, 'body': 'Internal server error'}
