@@ -1,0 +1,116 @@
+You can get those user attributes by making another call to the Microsoft Graph API using the member ID you receive in the webhook notification.
+
+You'll use the /users/{id} endpoint with the $select query parameter to specify exactly which attributes you want. This is much more efficient than fetching the entire user object.
+
+How It Works
+When your webhook-triggered Lambda receives a notification about a new member, the payload contains the user's id (which is their Object ID in Azure AD). You simply take this ID and use it in a new API call.
+
+Endpoint: https://graph.microsoft.com/v1.0/users/{user-id}
+
+Query Parameter: $select=displayName,userPrincipalName,mail
+
+Full URL: https://graph.microsoft.com/v1.0/users/{user-id}?$select=displayName,userPrincipalName,mail
+
+This will return a JSON object with only the three attributes you requested.
+
+Updated Lambda Code
+Here is how you would modify your notification-handling Lambda to include this logic. This example assumes you have a way to get a Graph API access token, similar to the renewal function.
+
+Python
+
+import os
+import json
+import requests
+import logging
+
+# --- Assume these are configured, e.g., via environment variables ---
+TENANT_ID = os.environ.get("TENANT_ID")
+CLIENT_ID = os.environ.get("CLIENT_ID")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET") # Store securely in Secrets Manager
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def get_graph_access_token():
+    """Authenticates to get an access token. Re-use from renewal Lambda."""
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    payload = {
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'scope': 'https://graph.microsoft.com/.default',
+        'grant_type': 'client_credentials'
+    }
+    response = requests.post(url, data=payload)
+    response.raise_for_status()
+    return response.json()['access_token']
+
+def get_user_details(user_id, access_token):
+    """Gets specific attributes for a given user ID from Microsoft Graph."""
+    try:
+        # Define which attributes (fields) you want to retrieve
+        fields = "displayName,userPrincipalName,mail"
+        graph_url = f"https://graph.microsoft.com/v1.0/users/{user_id}?$select={fields}"
+        
+        headers = {'Authorization': f'Bearer {access_token}'}
+        response = requests.get(graph_url, headers=headers)
+        response.raise_for_status() # Raise an exception for bad status codes
+        
+        logger.info(f"Successfully retrieved details for user {user_id}")
+        return response.json()
+        
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP Error getting user details for {user_id}: {e.response.text}")
+        return None
+
+def lambda_handler(event, context):
+    """Handles webhook notifications, including fetching user details."""
+    logger.info("Received event, processing notification...")
+
+    # For simplicity, we get a token for each invocation.
+    # In a high-traffic app, you might cache this token.
+    try:
+        access_token = get_graph_access_token()
+    except Exception as e:
+        logger.error(f"FATAL: Could not get Graph API access token. {e}")
+        return {'statusCode': 500}
+    
+    try:
+        notification_data = json.loads(event['body'])
+        changes = notification_data.get('value', [])
+
+        for change in changes:
+            # For removed members, the ID is at the top level of the change object
+            if '@removed' in change:
+                member_id = change.get('id')
+                logger.info(f"User REMOVED. Member ID: {member_id}")
+                # You cannot get details of a user that has just been deleted from a group
+                # if the user object itself is also being deleted. But for simple group
+                # removals, the user object still exists.
+                
+            # For added members, the member ID is usually inside 'resourceData'
+            else:
+                logger.info("User ADDED.")
+                resource_data = change.get('resourceData', {})
+                member_id = resource_data.get('id')
+                
+                if member_id:
+                    logger.info(f"Fetching details for added member ID: {member_id}")
+                    user_details = get_user_details(member_id, access_token)
+                    
+                    if user_details:
+                        displayName = user_details.get('displayName')
+                        upn = user_details.get('userPrincipalName')
+                        mail = user_details.get('mail')
+                        
+                        logger.info(f"--> Display Name: {displayName}")
+                        logger.info(f"--> User Principal Name: {upn}")
+                        logger.info(f"--> Email: {mail}")
+                        
+                        # >>> YOUR CORE LOGIC GOES HERE <<<
+                        # e.g., Add these details to a database, call another API, etc.
+            
+        return {'statusCode': 202} # Acknowledge receipt
+
+    except Exception as e:
+        logger.error(f"Error processing notification: {e}", exc_info=True)
+        return {'statusCode': 500}
