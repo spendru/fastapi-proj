@@ -1,0 +1,101 @@
+import os
+import json
+import requests
+import logging
+import boto3 # Import the AWS SDK
+
+# --- AWS & Boto3 Configuration ---
+# This will be used by Boto3 to make API calls to QuickSight
+AWS_ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID")
+QUICKSIGHT_GROUP_NAME = "YourQuickSightGroupName" # The QuickSight group to remove the user from
+# Boto3 will automatically use the Lambda's execution role for credentials
+quicksight_client = boto3.client('quicksight')
+
+# (Your existing get_graph_access_token and get_user_details functions remain here)
+# ...
+
+def remove_from_quicksight(user_name):
+    """Removes a user from a QuickSight group and then deletes the user."""
+    
+    # --- Step 1: Remove user from the QuickSight group ---
+    try:
+        logger.info(f"Removing user '{user_name}' from QuickSight group '{QUICKSIGHT_GROUP_NAME}'...")
+        quicksight_client.delete_group_membership(
+            AwsAccountId=AWS_ACCOUNT_ID,
+            Namespace='default',
+            GroupName=QUICKSIGHT_GROUP_NAME,
+            MemberName=user_name
+        )
+        logger.info(f"✅ Successfully removed user from group.")
+    except quicksight_client.exceptions.NotFoundException:
+        logger.warning(f"User '{user_name}' was not found in group '{QUICKSIGHT_GROUP_NAME}'. Skipping group removal.")
+    except Exception as e:
+        logger.error(f"Error removing user from QuickSight group: {e}")
+        # Depending on requirements, you might stop here or continue to user deletion
+        # For this example, we will continue
+        
+    # --- Step 2: Delete the user from QuickSight entirely ---
+    try:
+        logger.info(f"Deleting user '{user_name}' from QuickSight...")
+        quicksight_client.delete_user(
+            AwsAccountId=AWS_ACCOUNT_ID,
+            Namespace='default',
+            UserName=user_name
+        )
+        logger.info(f"✅ Successfully deleted QuickSight user.")
+    except quicksight_client.exceptions.NotFoundException:
+        logger.warning(f"User '{user_name}' not found in QuickSight. Already deleted.")
+    except Exception as e:
+        logger.error(f"Error deleting QuickSight user: {e}")
+
+
+def lambda_handler(event, context):
+    """
+    Handles webhook notifications and manages QuickSight users.
+    """
+    logger.info("Received event, processing notification...")
+
+    try:
+        access_token = get_graph_access_token()
+    except Exception as e:
+        logger.error(f"FATAL: Could not get Graph API access token. {e}")
+        return {'statusCode': 500, 'body': 'Authentication failed'}
+
+    try:
+        notification_data = json.loads(event['body'])
+        changes = notification_data.get('value', [])
+
+        for change in changes:
+            resource_data = change.get('resourceData', {})
+            member_changes = resource_data.get('members@delta', [])
+
+            for member_change in member_changes:
+                member_id = member_change.get('id')
+                if not member_id:
+                    continue
+
+                # Get user details from Graph API to find the UPN (QuickSight UserName)
+                user_details = get_user_details(member_id, access_token)
+                if not user_details:
+                    logger.warning(f"Could not retrieve details for member {member_id}. Cannot proceed with QuickSight actions.")
+                    continue
+                
+                quicksight_user_name = user_details.get('userPrincipalName')
+                if not quicksight_user_name:
+                    logger.warning(f"User Principal Name not found for member {member_id}.")
+                    continue
+
+                if '@removed' in member_change:
+                    logger.info(f"User REMOVED event received for {quicksight_user_name}.")
+                    # >> TRIGGER QUICKSIGHT REMOVAL LOGIC <<
+                    remove_from_quicksight(quicksight_user_name)
+                
+                else:
+                    logger.info(f"User ADDED event received for {quicksight_user_name}.")
+                    # >> Your user creation logic would go here <<
+
+        return {'statusCode': 202, 'body': 'Notification processed'}
+
+    except Exception as e:
+        logger.error(f"Error processing notification: {e}", exc_info=True)
+        return {'statusCode': 500, 'body': 'Internal server error'}
