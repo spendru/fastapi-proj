@@ -152,6 +152,64 @@ My contributions consistently exceeded expectations by not only meeting my own g
 
 
 
+"I took the lead in a team initiative to simplify Python development. I conducted a practical session on environment setup, providing hands-on assistance and ready-to-use sample projects. This helped colleagues quickly get up and running, ensuring a smoother start to their projects and a more consistent development workflow across the team."
+
+
+
+
+
+
+
+As part of individual accomplishment, add couple of lines to operationalize successfully a project called AdvancedMD, met with stakeholders post deployment, understand the gaps , came up with a solution and implemented it successfully without much input/intervention, practically on my own
+
+
+
+I successfully operationalized the AdvancedMD project, taking full ownership from deployment to post-launch optimization. Following a review with stakeholders, I independently identified key operational gaps, developed a solution to address them, and implemented it, ensuring the project's long-term success with minimal external intervention.
+
+
+
+
+
+
+
+Add couple of lines highlighting code and infra deployments using Azure DevOps and making sure quality checks are done using veracode pipeline, making sure developers following best practices using veracode in ide
+
+
+
+My role was crucial in standardizing our deployment processes by utilizing Azure DevOps for both code and infrastructure deployments. I integrated Veracode directly into our pipelines to enforce automated quality checks and worked with the development team to promote best practices for secure coding using Veracode's IDE integration. This ensured we maintained high standards of quality and security from the start of the development lifecycle.
+
+
+
+
+
+
+
+Add couple of lines highlighting the automation of AWS quick sight user provisioning. From a one line requirement to architecting the solution, implementation and execution. Working with cross functional team to handle their part.
+
+
+
+I took a one-line request for AWS QuickSight user provisioning and transformed it into a fully automated solution. I architected, implemented, and executed the entire workflow, collaborating with cross-functional teams to ensure seamless integration and execution. This initiative significantly streamlined the user onboarding process, reducing manual effort and improving efficiency.
+
+
+
+
+
+
+
+
+add couple of lines highlighting documentation of backend apis using swagger and help the team achieve the same for other projects,
+
+
+I led the effort to document our backend APIs using Swagger, creating a clear and interactive reference for our services. I then guided the team in adopting this practice, helping them implement the same for their projects to improve cross-functional collaboration and streamline development.
+
+
+
+
+
+
+
+
+
 
 
 
