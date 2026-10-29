@@ -1,0 +1,610 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Teams notification hub - EventBridge bus, SQS buffer, notifier Lambda,
+  REST ingest API for non-AWS apps, card-callback API for Power Automate,
+  and pipeline health alarms.
+
+Parameters:
+  HubName:
+    Type: String
+    Default: teams-notify
+    AllowedPattern: "^[a-z0-9-]+$"
+    Description: Prefix for resource names.
+  OrgId:
+    Type: String
+    Default: ""
+    Description: AWS Organizations ID (o-xxxx) allowed to put events on the bus. Leave empty for same-account only.
+  DefaultEnv:
+    Type: String
+    Default: prod
+  PipelineAlarmEmail:
+    Type: String
+    Description: Email that receives alarms about the notification pipeline itself (not via Teams, since Teams may be the thing that is broken).
+  DedupeMinutes:
+    Type: Number
+    Default: 15
+    Description: Repeats of an un-acknowledged incident inside this window are counted, not posted.
+  AckSuppressHours:
+    Type: Number
+    Default: 24
+    Description: After Acknowledge, repeats are suppressed until resolved or this many hours pass.
+  SnoozeMinutes:
+    Type: Number
+    Default: 60
+  EventRetentionDays:
+    Type: Number
+    Default: 90
+  IngestRateLimit:
+    Type: Number
+    Default: 20
+    Description: Requests/second allowed per API key on the ingest API.
+
+Conditions:
+  HasOrg: !Not [!Equals [!Ref OrgId, ""]]
+
+Resources:
+  # ------------------------------------------------------------------ bus
+  NotificationBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub ${HubName}-bus
+
+  OrgPutEventsPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Condition: HasOrg
+    Properties:
+      EventBusName: !Ref NotificationBus
+      StatementId: AllowOrgPutEvents
+      Statement:
+        Effect: Allow
+        Principal: "*"
+        Action: events:PutEvents
+        Resource: !GetAtt NotificationBus.Arn
+        Condition:
+          StringEquals:
+            aws:PrincipalOrgID: !Ref OrgId
+
+  # ------------------------------------------------------------------ queue
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${HubName}-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${HubName}-queue
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  NotificationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref NotificationQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotificationQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt NotificationsRule.Arn
+                  - !GetAtt HeartbeatRule.Arn
+
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref DeadLetterQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt NotificationsRule.Arn
+
+  NotificationsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${HubName}-to-queue
+      EventBusName: !Ref NotificationBus
+      EventPattern:
+        source:
+          - prefix: "app."
+          - aws.cloudwatch
+          - aws.ecs
+          - lambda
+      Targets:
+        - Id: queue
+          Arn: !GetAtt NotificationQueue.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt DeadLetterQueue.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 185
+            MaximumEventAgeInSeconds: 86400
+
+  # Scheduled rules only work on the default bus. Exercises the full path to the flow.
+  HeartbeatRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${HubName}-heartbeat
+      ScheduleExpression: rate(1 hour)
+      Targets:
+        - Id: queue
+          Arn: !GetAtt NotificationQueue.Arn
+          InputTransformer:
+            InputPathsMap:
+              id: $.id
+              time: $.time
+            InputTemplate: '{"id": <id>, "time": <time>, "source": "notification-hub", "detail-type": "Heartbeat", "detail": {}}'
+
+  # ------------------------------------------------------------------ state
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${HubName}-events
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: eventId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: eventId, KeyType: HASH }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${HubName}-incidents
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: incidentId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: incidentId, KeyType: HASH }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+  FlowSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${HubName}/power-automate
+      Description: Power Automate flow URL and Entra ID app credentials. Fill in after the flow is built.
+      SecretString: >-
+        {"flowUrl": "REPLACE_ME", "authMode": "oauth", "tenantId": "REPLACE_ME",
+        "clientId": "REPLACE_ME", "clientSecret": "REPLACE_ME",
+        "scope": "https://service.flow.microsoft.com//.default"}
+
+  # ------------------------------------------------------------------ notifier
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${HubName}-notifier
+      RetentionInDays: 90
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: notifier
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt NotificationQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: [!GetAtt EventsTable.Arn, !GetAtt IncidentsTable.Arn]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref FlowSecret
+
+  NotifierFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: NotifierLogGroup
+    Properties:
+      FunctionName: !Sub ${HubName}-notifier
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: app.handler
+      Code: ../src/notifier
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt NotifierRole.Arn
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref EventsTable
+          INCIDENTS_TABLE: !Ref IncidentsTable
+          FLOW_SECRET_ARN: !Ref FlowSecret
+          DEFAULT_ENV: !Ref DefaultEnv
+          DEDUPE_MINUTES: !Ref DedupeMinutes
+          ACK_SUPPRESS_HOURS: !Ref AckSuppressHours
+          SNOOZE_MINUTES: !Ref SnoozeMinutes
+          EVENT_RETENTION_DAYS: !Ref EventRetentionDays
+          METRIC_NAMESPACE: !Ref HubName
+
+  NotifierQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      EventSourceArn: !GetAtt NotificationQueue.Arn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 2
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: 5   # keeps the call rate to Power Automate / Teams modest
+
+  # ------------------------------------------------------------------ card callback
+  AckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${HubName}-ack
+      RetentionInDays: 90
+
+  AckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt IncidentsTable.Arn
+
+  AckFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AckLogGroup
+    Properties:
+      FunctionName: !Sub ${HubName}-ack
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: app.ack_handler
+      Code: ../src/notifier
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt AckRole.Arn
+      Environment:
+        Variables:
+          INCIDENTS_TABLE: !Ref IncidentsTable
+          ACK_SUPPRESS_HOURS: !Ref AckSuppressHours
+          SNOOZE_MINUTES: !Ref SnoozeMinutes
+          METRIC_NAMESPACE: !Ref HubName
+
+  CallbackApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${HubName}-callback
+      Description: Called by the Power Automate flow when a card button is clicked.
+      EndpointConfiguration: { Types: [REGIONAL] }
+
+  CallbackAckResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CallbackApi
+      ParentId: !GetAtt CallbackApi.RootResourceId
+      PathPart: ack
+
+  CallbackAckMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CallbackApi
+      ResourceId: !Ref CallbackAckResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AckFunction.Arn}/invocations
+
+  AckInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AckFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CallbackApi}/*/POST/ack
+
+  CallbackDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: CallbackAckMethod
+    Properties:
+      RestApiId: !Ref CallbackApi
+
+  CallbackStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref CallbackApi
+      DeploymentId: !Ref CallbackDeployment
+      StageName: v1
+
+  CallbackUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: CallbackStage
+    Properties:
+      UsagePlanName: !Sub ${HubName}-callback
+      ApiStages:
+        - ApiId: !Ref CallbackApi
+          Stage: v1
+      Throttle: { RateLimit: 10, BurstLimit: 20 }
+
+  PowerAutomateApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: CallbackStage
+    Properties:
+      Name: !Sub ${HubName}-power-automate
+      Description: Used by the Power Automate flow to call /ack
+      Enabled: true
+
+  PowerAutomateUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref PowerAutomateApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref CallbackUsagePlan
+
+  # ------------------------------------------------------------------ ingest API (apps outside AWS)
+  IngestApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: put-events
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt NotificationBus.Arn
+
+  IngestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${HubName}-ingest
+      Description: POST /notify - for applications that cannot call EventBridge directly.
+      EndpointConfiguration: { Types: [REGIONAL] }
+
+  IngestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref IngestApi
+      ValidateRequestBody: true
+      ValidateRequestParameters: false
+
+  NotificationModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref IngestApi
+      Name: AppNotification
+      ContentType: application/json
+      Schema:
+        $schema: "http://json-schema.org/draft-04/schema#"
+        type: object
+        additionalProperties: false
+        required: [app, severity, title]
+        properties:
+          schemaVersion: { type: string }
+          app: { type: string, pattern: "^[a-z0-9][a-z0-9-]{1,62}$" }
+          env: { type: string, maxLength: 32 }
+          severity: { type: string, enum: [INFO, WARNING, ERROR, CRITICAL] }
+          category: { type: string, maxLength: 64 }
+          title: { type: string, minLength: 1, maxLength: 200 }
+          message: { type: string, maxLength: 4000 }
+          incidentId: { type: string, maxLength: 256 }
+          status: { type: string, enum: [open, resolved] }
+          links:
+            type: object
+            additionalProperties: { type: string, pattern: "^https://", maxLength: 2048 }
+          attributes:
+            type: object
+            additionalProperties: { type: string, maxLength: 300 }
+
+  IngestNotifyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref IngestApi
+      ParentId: !GetAtt IngestApi.RootResourceId
+      PathPart: notify
+
+  IngestNotifyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref IngestApi
+      ResourceId: !Ref IngestNotifyResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestValidatorId: !Ref IngestValidator
+      RequestModels:
+        application/json: !Ref NotificationModel
+      MethodResponses:
+        - StatusCode: "200"
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:events:action/PutEvents
+        Credentials: !GetAtt IngestApiRole.Arn
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.X-Amz-Target: "'AWSEvents.PutEvents'"
+          integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+        RequestTemplates:
+          application/json: !Sub
+            - |
+              #set($body = $util.escapeJavaScript($input.json('$')).replaceAll("\\'", "'"))
+              {"Entries": [{
+                "EventBusName": "${Bus}",
+                "Source": "app.$input.path('$.app')",
+                "DetailType": "AppNotification",
+                "Detail": "$body"
+              }]}
+            - Bus: !Ref NotificationBus
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseTemplates:
+              application/json: |
+                #set($r = $input.path('$'))
+                #if($r.FailedEntryCount > 0)
+                #set($context.responseOverride.status = 502)
+                {"status": "failed", "error": "$r.Entries[0].ErrorMessage"}
+                #else
+                {"status": "accepted", "eventId": "$r.Entries[0].EventId"}
+                #end
+
+  IngestDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: IngestNotifyMethod
+    Properties:
+      RestApiId: !Ref IngestApi
+
+  IngestStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref IngestApi
+      DeploymentId: !Ref IngestDeployment
+      StageName: v1
+
+  IngestUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: IngestStage
+    Properties:
+      UsagePlanName: !Sub ${HubName}-ingest
+      Description: Add one API key per external application (scripts/add-ingest-key.sh).
+      ApiStages:
+        - ApiId: !Ref IngestApi
+          Stage: v1
+      Throttle:
+        RateLimit: !Ref IngestRateLimit
+        BurstLimit: 50
+
+  # ------------------------------------------------------------------ pipeline health
+  PipelineAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${HubName}-pipeline-alarms
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref PipelineAlarmEmail
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${HubName}-dlq-not-empty
+      AlarmDescription: Notifications failed delivery 5 times and are parked in the DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt DeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref PipelineAlarmTopic]
+      OKActions: [!Ref PipelineAlarmTopic]
+
+  QueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${HubName}-queue-backlog
+      AlarmDescription: Oldest notification has waited more than 10 minutes - delivery is failing or slow.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{ Name: QueueName, Value: !GetAtt NotificationQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref PipelineAlarmTopic]
+      OKActions: [!Ref PipelineAlarmTopic]
+
+  HeartbeatMissingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${HubName}-heartbeat-missing
+      AlarmDescription: The hourly heartbeat did not reach the Power Automate flow for 2 hours.
+      Namespace: !Ref HubName
+      MetricName: HeartbeatDelivered
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref PipelineAlarmTopic]
+      OKActions: [!Ref PipelineAlarmTopic]
+
+  NotifierErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${HubName}-delivery-failures
+      AlarmDescription: Calls to the Power Automate flow are failing.
+      Namespace: !Ref HubName
+      MetricName: DeliveryFailed
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref PipelineAlarmTopic]
+
+Outputs:
+  BusName:
+    Value: !Ref NotificationBus
+    Export: { Name: !Sub "${HubName}-BusName" }
+  BusArn:
+    Value: !GetAtt NotificationBus.Arn
+    Export: { Name: !Sub "${HubName}-BusArn" }
+  IngestUrl:
+    Description: POST AppNotification JSON here with header x-api-key.
+    Value: !Sub https://${IngestApi}.execute-api.${AWS::Region}.amazonaws.com/v1/notify
+  IngestUsagePlanId:
+    Value: !Ref IngestUsagePlan
+  CallbackUrl:
+    Description: Put this in the flow's AckUrl environment variable.
+    Value: !Sub https://${CallbackApi}.execute-api.${AWS::Region}.amazonaws.com/v1/ack
+  PowerAutomateApiKeyId:
+    Description: "Get the value with: aws apigateway get-api-key --include-value --api-key <id>"
+    Value: !Ref PowerAutomateApiKey
+  FlowSecretArn:
+    Value: !Ref FlowSecret
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue

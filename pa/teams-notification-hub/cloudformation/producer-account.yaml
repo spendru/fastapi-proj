@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Deploy once in every account/region that runs applications (including the hub
+  account itself). Forwards failures AWS detects on its own - CloudWatch alarm
+  state changes, failed ECS tasks and Lambda async failures - from the default
+  bus to the Teams notification hub bus.
+
+Parameters:
+  HubBusArn:
+    Type: String
+    Description: BusArn output of the hub stack.
+  AlarmNamePrefix:
+    Type: String
+    Default: notify-
+    Description: Only CloudWatch alarms whose name starts with this are forwarded.
+  ForwardEcsFailures:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  Ecs: !Equals [!Ref ForwardEcsFailures, "true"]
+
+Resources:
+  ForwardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: put-to-hub
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref HubBusArn
+
+  AlarmStateRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: CloudWatch alarms named <prefix>* -> Teams hub
+      EventPattern:
+        source: [aws.cloudwatch]
+        detail-type: [CloudWatch Alarm State Change]
+        detail:
+          alarmName: [{ prefix: !Ref AlarmNamePrefix }]
+          state:
+            value: [ALARM, OK]
+      Targets:
+        - { Id: hub, Arn: !Ref HubBusArn, RoleArn: !GetAtt ForwardRole.Arn }
+
+  EcsTaskFailureRule:
+    Type: AWS::Events::Rule
+    Condition: Ecs
+    Properties:
+      Description: ECS tasks that stopped with a non-zero exit code or failed to start -> Teams hub
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          lastStatus: [STOPPED]
+          # deployments / scale-in stop tasks with 137/143; those are not failures
+          stopCode: [{ anything-but: [ServiceSchedulerInitiated, UserInitiated] }]
+          $or:
+            - containers:
+                exitCode: [{ anything-but: 0 }]
+            - stopCode: [TaskFailedToStart]
+      Targets:
+        - { Id: hub, Arn: !Ref HubBusArn, RoleArn: !GetAtt ForwardRole.Arn }
+
+  LambdaFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Lambda async invocation failures (OnFailure destination = default bus) -> Teams hub
+      EventPattern:
+        source: [lambda]
+        detail-type: [Lambda Function Invocation Result - Failure]
+      Targets:
+        - { Id: hub, Arn: !Ref HubBusArn, RoleArn: !GetAtt ForwardRole.Arn }
+
+Outputs:
+  DefaultBusArn:
+    Description: Use as the OnFailure destination of async-invoked Lambda functions.
+    Value: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
